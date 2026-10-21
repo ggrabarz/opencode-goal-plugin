@@ -30,6 +30,7 @@ import {
   updateGoalObjective,
   validateEvidence,
   validateObjective,
+  waitForPendingMutations,
 } from "../src/state"
 
 let dir = ""
@@ -1208,4 +1209,15 @@ test("rolling back a continuation restores the minimum interval anchor", async (
 
   setSystemTime(new Date(base + 1_100))
   expect(await reserveContinuation("ses_1", 10, 1)).not.toBeNull()
+})
+
+test("waiting for pending mutations waits for the queued writes", async () => {
+  // A host that reloads the plugin tears the state directory down with it. A
+  // write that is still in flight then fails and the change it carried is
+  // lost, so the plugin has to let the queued writes finish before it goes.
+  await createGoal("ses_1", "first", null)
+  const pending = setGoalStatus("ses_1", "paused", null)
+  await waitForPendingMutations()
+  expect((await getGoal("ses_1"))?.status).toBe("paused")
+  await pending
 })
