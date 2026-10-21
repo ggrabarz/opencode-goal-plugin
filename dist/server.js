@@ -5493,8 +5493,13 @@ async function setupV2(context) {
         if (done)
           break;
         const event = decodeV2Event(value);
-        if (event)
+        if (!event)
+          continue;
+        try {
           await handleV2Event(event);
+        } catch (error) {
+          v2ErrorLog("Failed to handle a V2 event", error);
+        }
       }
     } catch (error) {
       if (!abortController.signal.aborted)
