@@ -4120,7 +4120,7 @@ var server = async ({ client }, options) => {
       }
     }
   }
-  return {
+  return guardHooks({
     async dispose() {
       disposed = true;
       stopStateRecoveryReporting();
@@ -4496,16 +4496,31 @@ var server = async ({ client }, options) => {
         v2ErrorLog("Failed to handle a V1 event", error);
       }
     }
-  };
+  });
 };
-function guardToolHook(what, callback) {
-  return async (input) => {
+function guardHook(what, callback) {
+  return async (...args) => {
     try {
-      await callback(input);
+      return await callback(...args);
     } catch (error) {
       v2ErrorLog(`Failed to run ${what}`, error);
+      return;
     }
   };
+}
+function guardHooks(hooks) {
+  const guarded = {};
+  for (const [name, value] of Object.entries(hooks)) {
+    guarded[name] = typeof value === "function" ? async (...args) => {
+      try {
+        return await value(...args);
+      } catch (error) {
+        v2ErrorLog(`Failed to run the ${name} hook`, error);
+        return;
+      }
+    } : value;
+  }
+  return guarded;
 }
 function v2ErrorLog(message, error) {
   try {
@@ -5382,7 +5397,7 @@ async function setupV2(context) {
     }));
   }
   if (registerCommand) {
-    await registerSafely("the prompt hook", () => context.session.hook("prompt", async (input) => {
+    await registerSafely("the prompt hook", () => context.session.hook("prompt", guardHook("the prompt hook", async (input) => {
       if (typeof input.sessionID === "string")
         markSessionOwnership(input.sessionID, true);
       explicitResumeRequests.delete(input.sessionID);
@@ -5405,7 +5420,7 @@ async function setupV2(context) {
       if (isExplicitResumePrompt(input.prompt.text, commandName, locale, messages)) {
         explicitResumeRequests.add(input.sessionID);
       }
-    }));
+    })));
   }
   try {
     const hookInterrupt = context.session.hook;
@@ -5423,7 +5438,7 @@ async function setupV2(context) {
     for (const tool of goalToolsV2(goalServices))
       draft.add(tool);
   }));
-  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", guardToolHook("the execute.before hook", async (input) => {
+  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", guardHook("the execute.before hook", async (input) => {
     taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id });
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
     if (sessionID)
@@ -5434,7 +5449,7 @@ async function setupV2(context) {
       toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
     }
   })));
-  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", guardToolHook("the execute.after hook", async (input) => {
+  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", guardHook("the execute.after hook", async (input) => {
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
     const callID = typeof input.id === "string" ? input.id : undefined;
     const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined;
@@ -5480,7 +5495,7 @@ async function setupV2(context) {
   }));
   try {
     const hookCompaction = context.session.hook;
-    await registerSafely("the compaction hook", () => hookCompaction("compaction", async (event) => {
+    await registerSafely("the compaction hook", () => hookCompaction("compaction", guardHook("the compaction hook", async (event) => {
       ensureSystemReminder(event.system);
       const goal = await getGoal(event.sessionID);
       if (!goal)
@@ -5488,7 +5503,7 @@ async function setupV2(context) {
       if (event.system.some((part) => part.type === "text" && part.text.startsWith(compactionContextPrefix(locale))))
         return;
       event.system.push({ type: "text", text: compactionContext(goal, locale) });
-    }));
+    })));
   } catch {}
   async function recoverTrackedTasks() {
     for (const item of (await getAllGoals()).goals) {
