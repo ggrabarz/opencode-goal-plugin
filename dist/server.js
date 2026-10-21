@@ -4136,6 +4136,7 @@ var server = async ({ client }, options) => {
       toolAttempts.clear();
       explicitResumeRequests.clear();
       objectiveEdits.clear();
+      await waitForPendingMutations();
     },
     async config(config) {
       if (!registerCommand)

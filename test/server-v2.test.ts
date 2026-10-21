@@ -3059,3 +3059,22 @@ test("V2 a failing session hook does not reject the hook", async () => {
   mock.stream.end()
   await cleanup()
 })
+
+test("V2 cleanup waits for the in-flight goal state writes", async () => {
+  // A host that reloads the plugin tears the state directory down with it, so
+  // a write that is still running would fail and lose the change it carried.
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "keep writing")
+
+  let settled = 0
+  const writes = Array.from({ length: 50 }, (_, index) =>
+    setGoalStatus("ses_v2", index % 2 === 0 ? "active" : "paused", null).then(() => {
+      settled += 1
+    }),
+  )
+  await cleanup()
+  // Every queued write has finished by the time the cleanup returns.
+  expect(settled).toBe(50)
+  await Promise.all(writes)
+})

@@ -4432,3 +4432,22 @@ test("V1 a failing message hook does not reject the hook", async () => {
   expect(chat).toBeDefined()
   await chat!({ sessionID: "ses_1", agent: "build" } as never, { message: { id: "m1", parts: [] } } as never)
 })
+
+test("V1 dispose waits for the in-flight goal state writes", async () => {
+  // A host that reloads the plugin tears the state directory down with it, so
+  // a write that is still running would fail and lose the change it carried.
+  const client = { session: { promptAsync: async () => {} } }
+  const hooks = await setupServer({ client } as never, { auto_continue: false })
+  await createGoal("ses_1", "keep writing", null)
+
+  let settled = 0
+  const writes = Array.from({ length: 50 }, (_, index) =>
+    setGoalStatus("ses_1", index % 2 === 0 ? "active" : "paused", null).then(() => {
+      settled += 1
+    }),
+  )
+  await hooks.dispose?.()
+  // Every queued write has finished by the time dispose returns.
+  expect(settled).toBe(50)
+  await Promise.all(writes)
+})
