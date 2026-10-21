@@ -310,6 +310,20 @@ function isTransientRenameError(error, platform) {
   const code = error?.code;
   return code === "EPERM" || code === "EACCES" || code === "EBUSY";
 }
+var OPEN_ATTEMPTS = 10;
+async function openWithRetry(ops, path, flags, mode) {
+  let attempt = 0;
+  for (;; ) {
+    try {
+      return await ops.open(path, flags, mode);
+    } catch (error) {
+      attempt += 1;
+      if (!isTransientRenameError(error, ops.platform) || attempt >= OPEN_ATTEMPTS)
+        throw error;
+      await ops.sleep(renameRetryDelayMs(attempt));
+    }
+  }
+}
 async function bestEffort(action) {
   try {
     await action();
@@ -383,7 +397,7 @@ async function atomicWriteFile(file, data, ops = defaultAtomicWriteOps) {
   let created = false;
   let renamed = false;
   try {
-    handle = await ops.open(tmp, "wx", 384);
+    handle = await openWithRetry(ops, tmp, "wx", 384);
     created = true;
     await handle.write(data);
     await handle.sync();
