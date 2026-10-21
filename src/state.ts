@@ -4,6 +4,7 @@ import { mkdir, readFile } from "node:fs/promises"
 import { dirname } from "node:path"
 import { Data, Effect, Schema } from "effect-goal-state"
 import { atomicWriteFile } from "./atomic-write"
+import { reportPluginError } from "./diagnostics"
 import { statePath } from "./state-path"
 import {
   applyGoalPlanOps,
@@ -402,6 +403,7 @@ function notifyStateRecovery(notice: StateRecoveryNotice) {
         } catch {
           // Reporting must never block state recovery.
         }
+        reportPluginError(`Failed to report quarantined state at ${notice.quarantineFile}`, error)
       })
   }
 }
@@ -488,6 +490,7 @@ function verifyRecoverySourceEffect(file: string, expectedContent: string, quara
         } catch {
           // Diagnostics must never block state recovery.
         }
+        reportPluginError(`Could not re-read ${file} after preserving it at ${quarantineFile}`, error)
       }
       return true
     }
@@ -567,6 +570,7 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
             } catch {
               // Diagnostics must never block state recovery.
             }
+            reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error)
             notifyStateRecovery(notice)
           } else {
             const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile)

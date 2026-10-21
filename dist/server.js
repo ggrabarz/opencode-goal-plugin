@@ -293,7 +293,7 @@ function goalPlanEntries(plan) {
 // src/state.ts
 import { randomUUID as randomUUID2 } from "crypto";
 import { mkdir, readFile } from "fs/promises";
-import { dirname as dirname2 } from "path";
+import { dirname as dirname3 } from "path";
 import { Data, Effect, Schema } from "effect-goal-state";
 
 // src/atomic-write.ts
@@ -408,6 +408,10 @@ async function atomicWriteFile(file, data, ops = defaultAtomicWriteOps) {
   }
 }
 
+// src/diagnostics.ts
+import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from "fs";
+import { dirname as dirname2, join as join2 } from "path";
+
 // src/state-path.ts
 import { homedir } from "os";
 import { join } from "path";
@@ -416,6 +420,39 @@ function statePath() {
     return process.env.OPENCODE_GOAL_STATE_PATH;
   const dataHome = process.env.XDG_DATA_HOME || (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : join(homedir(), ".local", "share"));
   return join(dataHome, "opencode-goal-plugin", "goals.json");
+}
+
+// src/diagnostics.ts
+var MAX_LOG_BYTES = 1024 * 1024;
+function diagnosticsLogPath() {
+  return join2(dirname2(statePath()), "goal-plugin.log");
+}
+function rotateIfNeeded(path) {
+  let size;
+  try {
+    size = statSync(path).size;
+  } catch {
+    return;
+  }
+  if (size < MAX_LOG_BYTES)
+    return;
+  const previous = `${path}.1`;
+  try {
+    unlinkSync(previous);
+  } catch {}
+  try {
+    renameSync(path, previous);
+  } catch {}
+}
+function reportPluginError(message, error) {
+  try {
+    const path = diagnosticsLogPath();
+    mkdirSync(dirname2(path), { recursive: true });
+    rotateIfNeeded(path);
+    const detail = error === undefined ? "" : ` | ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`;
+    appendFileSync(path, `${new Date().toISOString()} | error | ${message}${detail}
+`);
+  } catch {}
 }
 
 // src/state.ts
@@ -568,6 +605,7 @@ function notifyStateRecovery(notice) {
       try {
         console.error(`[opencode-goal-plugin] Failed to report quarantined state at ${notice.quarantineFile}:`, error instanceof Error ? error.message : String(error));
       } catch {}
+      reportPluginError(`Failed to report quarantined state at ${notice.quarantineFile}`, error);
     });
   }
 }
@@ -609,7 +647,7 @@ function quarantineStateEffect(file, content) {
   return Effect.promise(async () => {
     const quarantineFile = `${file}.corrupt-${Date.now()}-${randomUUID2()}`;
     try {
-      await mkdir(dirname2(file), { recursive: true, mode: 448 });
+      await mkdir(dirname3(file), { recursive: true, mode: 448 });
       await atomicWriteFile(quarantineFile, content);
       return { quarantineFile, error: null };
     } catch (error) {
@@ -626,6 +664,7 @@ function verifyRecoverySourceEffect(file, expectedContent, quarantineFile) {
         try {
           console.error(`[opencode-goal-plugin] Could not re-read ${file} after preserving it at ${quarantineFile}; continuing recovery:`, error instanceof Error ? error.message : String(error));
         } catch {}
+        reportPluginError(`Could not re-read ${file} after preserving it at ${quarantineFile}`, error);
       }
       return true;
     }
@@ -634,7 +673,7 @@ function verifyRecoverySourceEffect(file, expectedContent, quarantineFile) {
 function writeStateEffect(state, file = statePath()) {
   return Effect.tryPromise({
     try: async () => {
-      await mkdir(dirname2(file), { recursive: true, mode: 448 });
+      await mkdir(dirname3(file), { recursive: true, mode: 448 });
       await atomicWriteFile(file, JSON.stringify(state, null, 2) + `
 `);
     },
@@ -675,6 +714,7 @@ async function mutate(fn) {
           try {
             console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
           } catch {}
+          reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error);
           notifyStateRecovery(notice);
         } else {
           const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile);
@@ -4264,6 +4304,7 @@ function v2ErrorLog(message, error) {
   try {
     console.error(`[opencode-goal-plugin] ${message}:`, error instanceof Error ? error.message : String(error));
   } catch {}
+  reportPluginError(message, error);
 }
 async function setupV2(context) {
   const options = context.options ?? {};
