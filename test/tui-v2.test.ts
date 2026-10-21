@@ -498,16 +498,17 @@ test("themeColorV2 resolves nested, grouped, and legacy flat theme colors", () =
   expect(themeColorV2({}, ["text", "default"], ["text"])).toBeUndefined()
 })
 
-test("V2 setup registers sidebar.content and app slots and cleanup disposes them", () => {
+test("V2 setup registers sidebar.content, prompt.footer.status and app slots and cleanup disposes them", () => {
   const { mock, slots, disposed } = makeMockContext()
   const cleanup = setupTuiV2(mock as never)
 
   expect(slots.has("sidebar.content")).toBe(true)
+  expect(slots.has("prompt.footer.status")).toBe(true)
   expect(slots.has("app")).toBe(true)
   expect(disposed).toEqual([])
 
   cleanup()
-  expect(disposed.sort()).toEqual(["app", "sidebar.content"])
+  expect(disposed.sort()).toEqual(["app", "prompt.footer.status", "sidebar.content"])
 })
 
 test("goalFromV2Messages parses the newest completed goal tool output from text ToolContent", () => {
@@ -865,6 +866,116 @@ test("V2 palette command toasts a warning when no session is open", async () => 
     destroyed = true
   } finally {
     if (!destroyed) setup.renderer.destroy()
+    cleanup()
+  }
+})
+
+test("V2 the input box icon shows the glyph of the goal status", async () => {
+  const { mock, slots, setMessages } = makeMockContext()
+  const cleanup = setupTuiV2(mock as never)
+  const status = slots.get("prompt.footer.status")
+  expect(status).toBeTypeOf("function")
+  setMessages([
+    assistantMessage("created", [goalTool("create_goal", JSON.stringify({ goal: goal({ status: "paused" }) }))]),
+  ])
+
+  const setup = await testRender(() => status?.({ sessionID: "session" }) as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain(goalStatusGlyph("paused"))
+    setup.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) setup.renderer.destroy()
+    cleanup()
+  }
+})
+
+test("V2 the input box icon is empty without a goal", async () => {
+  const { mock, slots } = makeMockContext()
+  const cleanup = setupTuiV2(mock as never)
+  const status = slots.get("prompt.footer.status")
+
+  const setup = await testRender(() => status?.({ sessionID: "session" }) as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    for (const glyph of Object.values(GOAL_STATUS_GLYPHS)) {
+      expect(frame).not.toContain(glyph)
+    }
+    setup.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) setup.renderer.destroy()
+    cleanup()
+  }
+})
+
+test("V2 the input box icon follows the goal state in the same cycle as the sidebar", async () => {
+  const initial = goal({ objective: "live icon", status: "active" })
+  const { mock, slots, setMessages } = makeMockContext()
+  const cleanup = setupTuiV2(mock as never)
+  const sidebar = slots.get("sidebar.content")
+  const status = slots.get("prompt.footer.status")
+  setMessages([
+    assistantMessage("created", [goalTool("create_goal", JSON.stringify({ goal: initial }))]),
+  ])
+  await writeGoalState({
+    version: 2,
+    goals: { session: { ...initial, status: "paused", lastAccountedAt: 100 } },
+    archives: {},
+  })
+
+  const sidebarRender = await testRender(() => sidebar?.({ sessionID: "session" }) as never, { width: 80, height: 20 })
+  const statusRender = await testRender(() => status?.({ sessionID: "session" }) as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await sidebarRender.renderOnce()
+    await statusRender.renderOnce()
+    // The persisted state arrives on the poller, so both surfaces pick it up.
+    const firstDeadline = Date.now() + 5000
+    while (Date.now() < firstDeadline) {
+      await sidebarRender.flush()
+      await statusRender.flush()
+      if (sidebarRender.captureCharFrame().includes("Status: paused")) break
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    // The icon and the sidebar read the same state, so they show the same status.
+    expect(sidebarRender.captureCharFrame()).toContain("Status: paused")
+    expect(statusRender.captureCharFrame()).toContain(goalStatusGlyph("paused"))
+
+    const updated = { ...initial, status: "complete" as const, updatedAt: 101 }
+    await writeGoalState({
+      version: 2,
+      goals: { session: { ...updated, lastAccountedAt: 101 } },
+      archives: {},
+    })
+
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      await sidebarRender.flush()
+      await statusRender.flush()
+      if (
+        sidebarRender.captureCharFrame().includes("Goal achieved") &&
+        statusRender.captureCharFrame().includes(goalStatusGlyph("complete"))
+      )
+        break
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    expect(sidebarRender.captureCharFrame()).toContain("Goal achieved")
+    expect(statusRender.captureCharFrame()).toContain(goalStatusGlyph("complete"))
+    expect(statusRender.captureCharFrame()).not.toContain(goalStatusGlyph("paused"))
+
+    sidebarRender.renderer.destroy()
+    statusRender.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) {
+      sidebarRender.renderer.destroy()
+      statusRender.renderer.destroy()
+    }
     cleanup()
   }
 })
