@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { diagnosticsLogPath, reportPluginError } from "../src/diagnostics"
+import { describeError, diagnosticsLogPath, reportPluginError } from "../src/diagnostics"
 
 let dir = ""
 
@@ -55,4 +55,21 @@ test("reporting a plugin error never throws", async () => {
     process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals.json")
     expect(() => reportPluginError("still reported")).not.toThrow()
   })
+})
+
+test("the error description unwraps the cause chain", () => {
+  // The state layer reports failures through Effect, so the error that reaches
+  // a caller is a FiberFailure whose own message says nothing. The cause chain
+  // holds the real reason.
+  const inner = new Error("EPERM: operation not permitted, rename")
+  const tagged = Object.assign(new Error("An error has occurred"), { _tag: "StateWriteError", cause: inner })
+  const description = describeError(tagged)
+  expect(description).toContain("StateWriteError")
+  expect(description).toContain("EPERM")
+})
+
+test("the error description stops at a bounded depth", () => {
+  let error: unknown = new Error("root cause")
+  for (let depth = 0; depth < 20; depth++) error = { cause: error }
+  expect(describeError(error).length).toBeLessThan(2000)
 })
