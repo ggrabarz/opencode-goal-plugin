@@ -2791,9 +2791,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (!goal) {
         // A fast execution can settle before the minimum interval expires.
         // There may be no further idle event, so retain a timed wake-up rather
-        // than dropping the only continuation signal.
+        // than dropping the only continuation signal. The wake-up is retained
+        // even when an attempt is still outstanding: that attempt is resolved
+        // when the wake-up runs, and dropping the signal here would strand the
+        // goal until an unrelated event arrived.
         const waiting = await getGoalInternal(sessionID)
-        if (waiting?.status === "active" && waiting.pendingAttempt == null && waiting.lastContinuationAt != null && minInterval > 0) {
+        if (waiting?.status === "active" && waiting.lastContinuationAt != null && minInterval > 0) {
           scheduleSettledContinuation(
             sessionID,
             continuationDelayFromSnapshot(minInterval, waiting.lastContinuationAt),
