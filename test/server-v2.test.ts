@@ -2532,7 +2532,12 @@ test("V2 watchdog rescues a busy active goal without consuming auto-turn budgets
 })
 
 test("V2 create_goal keeps the current busy-turn watchdog armed", async () => {
-  const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.03 })
+  // The busy event arms the turn watchdog, and the goal is created while that
+  // window is already running. The window has to be wide enough for the goal
+  // to be written before the watchdog fires, or the rescue finds no goal and
+  // the test measures the speed of a state write rather than the behaviour it
+  // is about.
+  const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.3 })
   const cleanup = await setupPlugin(mock as never)
 
   await mock.stream.push({
