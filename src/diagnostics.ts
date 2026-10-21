@@ -46,6 +46,32 @@ function rotateIfNeeded(path: string) {
 }
 
 /**
+ * Effect keeps the cause of a failed fiber behind this symbol. The public
+ * `cause` getter is not usable for that, so the symbol is read directly.
+ */
+const EFFECT_CAUSE: symbol = Symbol.for("effect/Runtime/FiberFailure/Cause")
+
+/**
+ * Describe an Effect cause: a failure carries the error, a defect carries the
+ * thrown value, and a composite cause carries a set of both.
+ */
+function describeEffectCause(cause: unknown, depth: number): string {
+  if (cause == null || typeof cause !== "object") return String(cause)
+  const record = cause as Record<string, unknown>
+  if (record._tag === "Fail") return describeError(record.error, depth + 1)
+  if (record._tag === "Die") return describeError(record.defect, depth + 1)
+  if (record._tag === "Interrupt") return "interrupted"
+  const failures = record.failures
+  if (failures && typeof failures === "object") {
+    const parts = [...(failures as Iterable<unknown>)]
+      .map((failure) => describeEffectCause(failure, depth + 1))
+      .filter(Boolean)
+    if (parts.length) return parts.join(" ; ")
+  }
+  return describeError(cause, depth + 1)
+}
+
+/**
  * Describe an error and the causes behind it.
  *
  * The plugin's state layer reports failures through Effect, so the error that
@@ -70,6 +96,8 @@ export function describeError(error: unknown, depth = 0): string {
           : "Error"
   const message = typeof record.message === "string" ? record.message : ""
   const head = message && message !== tag ? `${tag}: ${message}` : tag
+  const effectCause = (record as Record<PropertyKey, unknown>)[EFFECT_CAUSE]
+  if (effectCause) return `${head} <- ${describeEffectCause(effectCause, depth)}`
   const cause = record.cause
   if (cause == null) return head
   if (typeof cause === "string") return `${head} <- ${cause}`

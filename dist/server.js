@@ -444,6 +444,25 @@ function rotateIfNeeded(path) {
     renameSync(path, previous);
   } catch {}
 }
+var EFFECT_CAUSE = Symbol.for("effect/Runtime/FiberFailure/Cause");
+function describeEffectCause(cause, depth) {
+  if (cause == null || typeof cause !== "object")
+    return String(cause);
+  const record = cause;
+  if (record._tag === "Fail")
+    return describeError(record.error, depth + 1);
+  if (record._tag === "Die")
+    return describeError(record.defect, depth + 1);
+  if (record._tag === "Interrupt")
+    return "interrupted";
+  const failures = record.failures;
+  if (failures && typeof failures === "object") {
+    const parts = [...failures].map((failure) => describeEffectCause(failure, depth + 1)).filter(Boolean);
+    if (parts.length)
+      return parts.join(" ; ");
+  }
+  return describeError(cause, depth + 1);
+}
 function describeError(error, depth = 0) {
   if (error == null)
     return String(error);
@@ -457,6 +476,9 @@ function describeError(error, depth = 0) {
   const tag = typeof record._tag === "string" ? record._tag : typeof record.name === "string" ? record.name : typeof record.constructor === "string" ? record.constructor : "Error";
   const message = typeof record.message === "string" ? record.message : "";
   const head = message && message !== tag ? `${tag}: ${message}` : tag;
+  const effectCause = record[EFFECT_CAUSE];
+  if (effectCause)
+    return `${head} <- ${describeEffectCause(effectCause, depth)}`;
   const cause = record.cause;
   if (cause == null)
     return head;
