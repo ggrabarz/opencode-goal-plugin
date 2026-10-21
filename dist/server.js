@@ -4380,6 +4380,13 @@ async function setupV2(context) {
     }
   };
   const registrations = [];
+  async function registerSafely(what, register) {
+    try {
+      registrations.push(await register());
+    } catch (error) {
+      v2ErrorLog(`Failed to register ${what}`, error);
+    }
+  }
   let disposed = false;
   let eventConsumerStopped = false;
   function stepKey(sessionID, messageID) {
@@ -5063,8 +5070,13 @@ async function setupV2(context) {
     }
   }
   if (registerCommand) {
-    const existingCommands = new Set((await context.command.list()).data.map((command) => command.name));
-    registrations.push(await context.command.transform((draft) => {
+    let existingCommands = new Set;
+    try {
+      existingCommands = new Set((await context.command.list()).data.map((command) => command.name));
+    } catch (error) {
+      v2ErrorLog("Failed to list the existing commands", error);
+    }
+    await registerSafely("the goal command", () => context.command.transform((draft) => {
       const claimedCommands = new Set(existingCommands);
       for (const command of goalCommandDefinitions(commandName, locale)) {
         if (claimedCommands.has(command.name))
@@ -5161,7 +5173,7 @@ async function setupV2(context) {
     }));
   }
   if (registerCommand) {
-    registrations.push(await context.session.hook("prompt", async (input) => {
+    await registerSafely("the prompt hook", () => context.session.hook("prompt", async (input) => {
       if (typeof input.sessionID === "string")
         markSessionOwnership(input.sessionID, true);
       explicitResumeRequests.delete(input.sessionID);
@@ -5188,7 +5200,7 @@ async function setupV2(context) {
   }
   try {
     const hookInterrupt = context.session.hook;
-    registrations.push(await hookInterrupt("interrupt", async ({ sessionID }) => {
+    await registerSafely("the interrupt hook", () => hookInterrupt("interrupt", async ({ sessionID }) => {
       markSessionOwnership(sessionID, true);
       goalServices.stopAutonomy?.(sessionID);
       try {
@@ -5198,11 +5210,11 @@ async function setupV2(context) {
       }
     }));
   } catch {}
-  registrations.push(await context.tool.transform((draft) => {
+  await registerSafely("the goal tools", () => context.tool.transform((draft) => {
     for (const tool of goalToolsV2(goalServices))
       draft.add(tool);
   }));
-  registrations.push(await context.tool.hook("execute.before", async (input) => {
+  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", async (input) => {
     taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id });
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
     if (sessionID)
@@ -5213,7 +5225,7 @@ async function setupV2(context) {
       toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
     }
   }));
-  registrations.push(await context.tool.hook("execute.after", async (input) => {
+  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", async (input) => {
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
     const callID = typeof input.id === "string" ? input.id : undefined;
     const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined;
@@ -5254,12 +5266,12 @@ async function setupV2(context) {
       return;
     system.push({ type: "text", text: reminder });
   };
-  registrations.push(await context.session.hook("context", (sessionContext) => {
+  await registerSafely("the context hook", () => context.session.hook("context", (sessionContext) => {
     ensureSystemReminder(sessionContext.system);
   }));
   try {
     const hookCompaction = context.session.hook;
-    registrations.push(await hookCompaction("compaction", async (event) => {
+    await registerSafely("the compaction hook", () => hookCompaction("compaction", async (event) => {
       ensureSystemReminder(event.system);
       const goal = await getGoal(event.sessionID);
       if (!goal)

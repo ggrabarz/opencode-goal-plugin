@@ -2917,3 +2917,33 @@ test("V2 a command transport abort preserves the active goal for reconnection", 
   await command
   expect((await getGoal("ses_v2"))?.status).toBe("active")
 })
+
+test("V2 a failing registration does not remove the plugin", async () => {
+  // A plugin that fails to register takes the whole location with it:
+  // OpenCode reports "Location plugins did not finish activating" and every
+  // command that needs the location fails. A single failing registration must
+  // degrade the plugin, not remove it.
+  const mock = makeMockContext({ auto_continue: false })
+  const failing = new Error("host refused the command list")
+  const context = {
+    ...mock,
+    command: {
+      ...mock.command,
+      list: async () => {
+        throw failing
+      },
+    },
+  }
+  // The setup completes instead of rejecting, and the registrations that do
+  // not depend on the failing read still happen.
+  const cleanup = await setupPlugin(context as never)
+
+  const registered = mock.tools.map((tool) => tool.name)
+  expect(registered).toContain("get_goal")
+  expect(registered).toContain("create_goal")
+  const commands = mock.commands.map((command) => command.name)
+  expect(commands).toContain("goal")
+
+  mock.stream.end()
+  await cleanup()
+})
