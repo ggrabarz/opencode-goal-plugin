@@ -19,8 +19,17 @@ import { statePath } from "./state-path"
 /** Rotate once the log passes this size so a failure loop cannot fill the disk. */
 const MAX_LOG_BYTES = 1024 * 1024
 
-export function diagnosticsLogPath() {
-  return join(dirname(statePath()), "goal-plugin.log")
+/**
+ * The diagnostics log of a state file.
+ *
+ * A failure has to be reported next to the state file it is about. The lock
+ * guards one specific state file, and a test or a tool can work on a state
+ * file of its own, so reporting every failure to the log of the global state
+ * file mixes unrelated failures into one place - and puts the failures of a
+ * test run into the log that a monitor watches for the running plugin.
+ */
+export function diagnosticsLogPath(stateFile?: string) {
+  return join(dirname(stateFile ?? statePath()), "goal-plugin.log")
 }
 
 function rotateIfNeeded(path: string) {
@@ -114,10 +123,14 @@ export function describeError(error: unknown, depth = 0): string {
 /**
  * Append one diagnostics line. Never throws: a failing diagnostics writer
  * must not turn a recoverable plugin error into a crash.
+ *
+ * The state file the failure is about decides where the line is written, so
+ * that the log next to a state file only holds the failures of that state
+ * file.
  */
-export function reportPluginError(message: string, error?: unknown) {
+export function reportPluginError(message: string, error?: unknown, stateFile?: string) {
   try {
-    const path = diagnosticsLogPath()
+    const path = diagnosticsLogPath(stateFile)
     mkdirSync(dirname(path), { recursive: true })
     rotateIfNeeded(path)
     const detail = error === undefined ? "" : ` | ${describeError(error)}`

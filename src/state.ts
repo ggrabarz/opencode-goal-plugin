@@ -405,7 +405,7 @@ function notifyStateRecovery(notice: StateRecoveryNotice) {
         } catch {
           // Reporting must never block state recovery.
         }
-        reportPluginError(`Failed to report quarantined state at ${notice.quarantineFile}`, error)
+        reportPluginError(`Failed to report quarantined state at ${notice.quarantineFile}`, error, notice.stateFile)
       })
   }
 }
@@ -511,7 +511,7 @@ function verifyRecoverySourceEffect(file: string, expectedContent: string, quara
         } catch {
           // Diagnostics must never block state recovery.
         }
-        reportPluginError(`Could not re-read ${file} after preserving it at ${quarantineFile}`, error)
+        reportPluginError(`Could not re-read ${file} after preserving it at ${quarantineFile}`, error, file)
       }
       return true
     }
@@ -608,7 +608,7 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
                 } catch {
                   // Diagnostics must never block state recovery.
                 }
-                reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error)
+                reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error, file)
                 notifyStateRecovery(notice)
               } else {
                 const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile)
