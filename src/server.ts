@@ -40,7 +40,7 @@ import {
 } from "./state"
 import type { GoalLocale, GoalMessages } from "./i18n"
 import { formatGoalHistoryPresentation, messagesFor, resolveLocale } from "./i18n"
-import { reportPluginError } from "./diagnostics"
+import { describeError, reportPluginError } from "./diagnostics"
 import { compactionContext, compactionContextPrefix, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
 
 type Options = {
@@ -1739,6 +1739,11 @@ const server: Plugin = async ({ client }, options?: Options) => {
         }
         if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID)) return
         await runAutoContinue(sessionID, true, scheduled)
+      } catch (error) {
+        // A timer callback that rejects becomes an unhandled rejection, which
+        // the host reports as a crash. The failure is reported and the schedule
+        // is cleaned up instead.
+        v2ErrorLog("Scheduled continuation failed", error)
       } finally {
         if (scheduledContinuations.get(sessionID) === scheduled) scheduledContinuations.delete(sessionID)
       }
@@ -2404,11 +2409,14 @@ const server: Plugin = async ({ client }, options?: Options) => {
 
 function v2ErrorLog(message: string, error: unknown) {
   try {
-    console.error(`[opencode-goal-plugin] ${message}:`, error instanceof Error ? error.message : String(error))
+    // The error is described through its cause chain: an Effect failure
+    // reports "An error has occurred" on its own, and the reason lives in the
+    // cause.
+    console.error(`[opencode-goal-plugin] ${message}:`, describeError(error))
   } catch {
     // Logging must never break plugin control flow.
   }
-  // The V2 plugin API has no logger and plugin console output does not reach
+  // The V2 plugin API has no logger and plugin console output never reaches
   // the OpenCode log, so the failure is also written to the plugin's own
   // diagnostics log where a monitor can see it.
   reportPluginError(message, error)
@@ -2635,6 +2643,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         }
         if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID)) return
         await runAutoContinue(sessionID, true, scheduled)
+      } catch (error) {
+        // A timer callback that rejects becomes an unhandled rejection, which
+        // the host reports as a crash. The failure is reported and the schedule
+        // is cleaned up instead.
+        v2ErrorLog("Scheduled continuation failed", error)
       } finally {
         if (scheduledContinuations.get(sessionID) === scheduled) scheduledContinuations.delete(sessionID)
       }
