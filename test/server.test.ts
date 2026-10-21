@@ -4361,3 +4361,42 @@ test("V1 only a sanitized explicit goal edit authorizes clearing a saved plan", 
   await requireTool(hooks.tool?.update_goal_objective,"update_goal_objective").execute({objective:"New user scope &amp; &lt;checks&gt;"},context)
   expect(await getGoal("ses_edit")).toMatchObject({objective:"New user scope & <checks>",plan:null,planRevision:2})
 })
+
+test("V1 a failing event does not reject the hook", async () => {
+  // The host keeps calling the event hook, so one event that fails must not
+  // break the dispatch: the failure is reported and the next event is still
+  // handled.
+  const calls: unknown[] = []
+  const client = { session: { promptAsync: async (input: unknown) => { calls.push(input) } } }
+  const hooks = await setupServer({ client } as never, { auto_continue: true, max_auto_turns: 5 })
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await requireTool(hooks.tool?.create_goal, "create_goal").execute(
+    { objective: "survive a failing event" },
+    { sessionID: "ses_1" } as never,
+  )
+  const original = await readFile(stateFile, "utf8")
+
+  // A state file that cannot be decoded makes the handler's state write fail.
+  await writeFile(stateFile, "{ not json", "utf8")
+  // The hook must not reject.
+  await hooks.event!({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "m1",
+          sessionID: "ses_1",
+          role: "assistant",
+          time: { completed: Date.now() },
+          parts: [{ type: "text", text: "hello" }],
+        },
+      },
+    } as never,
+  })
+
+  // A later event is still handled.
+  await writeFile(stateFile, original, "utf8")
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } } as never)
+  await waitFor(() => calls.length >= 1, 3000)
+  expect(calls.length).toBeGreaterThanOrEqual(1)
+})
