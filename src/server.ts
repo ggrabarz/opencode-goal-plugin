@@ -2272,138 +2272,144 @@ const server: Plugin = async ({ client }, options?: Options) => {
       if (goal?.status === "active") output.enabled = false
     },
     async event({ event }) {
-      const sessionID = sessionIDFromEvent(event as never)
-      const eventType = (event as { type?: string }).type
-      if (sessionID && isUserAbortEvent(event as never)) {
-        explicitResumeRequests.delete(sessionID)
-        goalServices.stopAutonomy?.(sessionID)
-        busySessions.delete(sessionID)
-        nativeRetrySessions.delete(sessionID)
-        watchdogRescuedSessions.delete(sessionID)
-        clearToolAttemptsForSession(toolAttempts, sessionID)
-        taskTracker.observeSessionStatus(sessionID, "idle")
-        await cancelActiveGoal(sessionID)
-        return
-      }
-      if (eventType === "session.created") {
-        taskTracker.observeSessionCreated(event as { properties?: Record<string, unknown> })
-      }
-      if (sessionID && eventType === "session.status") {
-        const status = (event as { properties?: Record<string, unknown> }).properties?.status
-        if (isRecord(status) && typeof status.type === "string") {
-          if (status.type === "busy") {
-            busySessions.add(sessionID)
-            busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1)
-            nativeRetrySessions.delete(sessionID)
-          }
-          if (status.type === "busy") armTurnWatchdog(sessionID)
-          if (status.type === "busy") await markPendingContinuationStarted(sessionID)
-          if (status.type === "idle") {
-            explicitResumeRequests.delete(sessionID)
-            busySessions.delete(sessionID)
-            nativeRetrySessions.delete(sessionID)
-            clearTurnWatchdog(sessionID)
-            watchdogRescuedSessions.delete(sessionID)
-          }
-          if (status.type === "retry") {
-            nativeRetrySessions.add(sessionID)
-            clearTurnWatchdog(sessionID)
-            cancelScheduledContinuation(sessionID)
-          }
-          taskTracker.observeSessionStatus(sessionID, status.type)
+      try {
+        const sessionID = sessionIDFromEvent(event as never)
+        const eventType = (event as { type?: string }).type
+        if (sessionID && isUserAbortEvent(event as never)) {
+          explicitResumeRequests.delete(sessionID)
+          goalServices.stopAutonomy?.(sessionID)
+          busySessions.delete(sessionID)
+          nativeRetrySessions.delete(sessionID)
+          watchdogRescuedSessions.delete(sessionID)
+          clearToolAttemptsForSession(toolAttempts, sessionID)
+          taskTracker.observeSessionStatus(sessionID, "idle")
+          await cancelActiveGoal(sessionID)
+          return
         }
-      }
-      if (sessionID && eventType === "session.idle") {
-        explicitResumeRequests.delete(sessionID)
-        busySessions.delete(sessionID)
-        nativeRetrySessions.delete(sessionID)
-        clearTurnWatchdog(sessionID)
-        watchdogRescuedSessions.delete(sessionID)
-        taskTracker.observeSessionStatus(sessionID, "idle")
-      }
-      if (sessionID && eventType === "session.error") {
-        explicitResumeRequests.delete(sessionID)
-        const inNativeRetry = nativeRetrySessions.has(sessionID)
-        busySessions.delete(sessionID)
-        clearTurnWatchdog(sessionID)
-        // A native provider retry episode is already recovering, so a transport
-        // error inside it must not schedule plugin recovery. A retry status can
-        // arrive before the error, so check the marker before clearing it; the
-        // episode ends (and the marker is removed) on the next busy or idle.
-        if (inNativeRetry) return
-        nativeRetrySessions.delete(sessionID)
-        watchdogRescuedSessions.delete(sessionID)
-        const props = (event as { properties?: Record<string, unknown> }).properties ?? {}
-        const errorMessage = transportErrorMessageFromEvent(props)
-        if (errorMessage && isTransportError(errorMessage)) {
-          const goal = await getGoalInternal(sessionID)
-          if (goal?.status === "active") {
-            const attempt = pendingAttemptOf(goal)
-            if (attempt != null) {
-              // The pending attempt failed at the transport level: count one
-              // failure and retry at the remaining min interval. The attempt id
-              // is required: a fast execution can reserve a newer attempt
-              // between the read and this write, and an unconditional failure
-              // would clear that newer attempt and count a phantom failure
-              // toward the pause ceiling.
-              const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
-                requirePending: true,
-                expectedGoalID: goal.id,
-                expectedAttemptID: attempt.id,
-              })
-              if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
-              if (autoContinue && afterFailure?.status === "active") {
+        if (eventType === "session.created") {
+          taskTracker.observeSessionCreated(event as { properties?: Record<string, unknown> })
+        }
+        if (sessionID && eventType === "session.status") {
+          const status = (event as { properties?: Record<string, unknown> }).properties?.status
+          if (isRecord(status) && typeof status.type === "string") {
+            if (status.type === "busy") {
+              busySessions.add(sessionID)
+              busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1)
+              nativeRetrySessions.delete(sessionID)
+            }
+            if (status.type === "busy") armTurnWatchdog(sessionID)
+            if (status.type === "busy") await markPendingContinuationStarted(sessionID)
+            if (status.type === "idle") {
+              explicitResumeRequests.delete(sessionID)
+              busySessions.delete(sessionID)
+              nativeRetrySessions.delete(sessionID)
+              clearTurnWatchdog(sessionID)
+              watchdogRescuedSessions.delete(sessionID)
+            }
+            if (status.type === "retry") {
+              nativeRetrySessions.add(sessionID)
+              clearTurnWatchdog(sessionID)
+              cancelScheduledContinuation(sessionID)
+            }
+            taskTracker.observeSessionStatus(sessionID, status.type)
+          }
+        }
+        if (sessionID && eventType === "session.idle") {
+          explicitResumeRequests.delete(sessionID)
+          busySessions.delete(sessionID)
+          nativeRetrySessions.delete(sessionID)
+          clearTurnWatchdog(sessionID)
+          watchdogRescuedSessions.delete(sessionID)
+          taskTracker.observeSessionStatus(sessionID, "idle")
+        }
+        if (sessionID && eventType === "session.error") {
+          explicitResumeRequests.delete(sessionID)
+          const inNativeRetry = nativeRetrySessions.has(sessionID)
+          busySessions.delete(sessionID)
+          clearTurnWatchdog(sessionID)
+          // A native provider retry episode is already recovering, so a transport
+          // error inside it must not schedule plugin recovery. A retry status can
+          // arrive before the error, so check the marker before clearing it; the
+          // episode ends (and the marker is removed) on the next busy or idle.
+          if (inNativeRetry) return
+          nativeRetrySessions.delete(sessionID)
+          watchdogRescuedSessions.delete(sessionID)
+          const props = (event as { properties?: Record<string, unknown> }).properties ?? {}
+          const errorMessage = transportErrorMessageFromEvent(props)
+          if (errorMessage && isTransportError(errorMessage)) {
+            const goal = await getGoalInternal(sessionID)
+            if (goal?.status === "active") {
+              const attempt = pendingAttemptOf(goal)
+              if (attempt != null) {
+                // The pending attempt failed at the transport level: count one
+                // failure and retry at the remaining min interval. The attempt id
+                // is required: a fast execution can reserve a newer attempt
+                // between the read and this write, and an unconditional failure
+                // would clear that newer attempt and count a phantom failure
+                // toward the pause ceiling.
+                const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
+                  requirePending: true,
+                  expectedGoalID: goal.id,
+                  expectedAttemptID: attempt.id,
+                })
+                if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
+                if (autoContinue && afterFailure?.status === "active") {
+                  scheduleSettledContinuation(
+                    sessionID,
+                    continuationRetryDelayMs(minInterval, attempt.reservedAt),
+                    true,
+                    "retry",
+                  )
+                }
+              } else if (autoContinue) {
+                // No pending attempt: start the first bounded automatic recovery
+                // without charging a phantom failure. Duplicate transport events
+                // dedupe through the scheduled-continuation timer.
                 scheduleSettledContinuation(
                   sessionID,
-                  continuationRetryDelayMs(minInterval, attempt.reservedAt),
-                  true,
-                  "retry",
+                  continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt),
+                  false,
+                  "recovery",
                 )
               }
-            } else if (autoContinue) {
-              // No pending attempt: start the first bounded automatic recovery
-              // without charging a phantom failure. Duplicate transport events
-              // dedupe through the scheduled-continuation timer.
-              scheduleSettledContinuation(
-                sessionID,
-                continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt),
-                false,
-                "recovery",
-              )
             }
           }
         }
-      }
-      if (sessionID && eventType === "session.deleted") {
-        continuationEpochs.invalidate(sessionID)
-        explicitResumeRequests.delete(sessionID)
-        busySessions.delete(sessionID)
-        busyRevisions.delete(sessionID)
-        clearTurnWatchdog(sessionID)
-        watchdogRescuedSessions.delete(sessionID)
-        locallyDeliveredPendingSessions.delete(sessionID)
-        nativeRetrySessions.delete(sessionID)
-        cancelScheduledContinuation(sessionID)
-        taskDeferredSessions.delete(sessionID)
-        clearToolAttemptsForSession(toolAttempts, sessionID)
-        taskTracker.observeSessionDeleted(sessionID)
-      }
-      if (sessionID && (event as { type?: string }).type === "message.updated") {
-        const props = (event as { properties?: Record<string, unknown> }).properties ?? {}
-        const message = [props.info, props.message].find((value) => value && typeof value === "object") as
-          | { info?: unknown; role?: unknown; id?: unknown; time?: unknown; parts?: unknown[] }
-          | undefined
-        taskTracker.observeAssistantMessage(sessionID, message)
-        const observed = await recordAssistantMessage(sessionID, message, options ?? {})
-        await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal)
-        const scheduled = scheduledContinuations.get(sessionID)
-        if (observed.progressed && scheduled?.purpose !== "settle") cancelScheduledContinuation(sessionID)
-      }
+        if (sessionID && eventType === "session.deleted") {
+          continuationEpochs.invalidate(sessionID)
+          explicitResumeRequests.delete(sessionID)
+          busySessions.delete(sessionID)
+          busyRevisions.delete(sessionID)
+          clearTurnWatchdog(sessionID)
+          watchdogRescuedSessions.delete(sessionID)
+          locallyDeliveredPendingSessions.delete(sessionID)
+          nativeRetrySessions.delete(sessionID)
+          cancelScheduledContinuation(sessionID)
+          taskDeferredSessions.delete(sessionID)
+          clearToolAttemptsForSession(toolAttempts, sessionID)
+          taskTracker.observeSessionDeleted(sessionID)
+        }
+        if (sessionID && (event as { type?: string }).type === "message.updated") {
+          const props = (event as { properties?: Record<string, unknown> }).properties ?? {}
+          const message = [props.info, props.message].find((value) => value && typeof value === "object") as
+            | { info?: unknown; role?: unknown; id?: unknown; time?: unknown; parts?: unknown[] }
+            | undefined
+          taskTracker.observeAssistantMessage(sessionID, message)
+          const observed = await recordAssistantMessage(sessionID, message, options ?? {})
+          await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal)
+          const scheduled = scheduledContinuations.get(sessionID)
+          if (observed.progressed && scheduled?.purpose !== "settle") cancelScheduledContinuation(sessionID)
+        }
 
-      if (!isIdleEvent(event as never)) return
-      if (!sessionID) return
-      if (!autoContinue && (await getGoalInternal(sessionID))?.pendingAttempt == null) return
-      await runAutoContinue(sessionID)
+        if (!isIdleEvent(event as never)) return
+        if (!sessionID) return
+        if (!autoContinue && (await getGoalInternal(sessionID))?.pendingAttempt == null) return
+        await runAutoContinue(sessionID)
+      } catch (error) {
+        // One event that fails must not take the plugin's event handling with it.
+        // The host keeps calling the hook, and a rejected hook breaks the dispatch.
+        v2ErrorLog("Failed to handle a V1 event", error)
+      }
     },
   }
 }
