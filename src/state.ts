@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
-import { mkdir, readFile } from "node:fs/promises"
+import { mkdir } from "node:fs/promises"
 import { dirname } from "node:path"
 import { Data, Effect, Schema } from "effect-goal-state"
 import { atomicWriteFile } from "./atomic-write"
 import { reportPluginError } from "./diagnostics"
 import { acquireStateLock, stateLockPath } from "./state-lock"
+import { readStateFile } from "./state-read"
 import { statePath } from "./state-path"
 import {
   applyGoalPlanOps,
@@ -440,7 +441,7 @@ function decodeState(value: unknown) {
 
 function readStateResultEffect(file = statePath()) {
   return Effect.tryPromise({
-    try: () => readFile(file, "utf8"),
+    try: () => readStateFile(file),
     catch: (cause) => new StateReadError({ cause }),
   }).pipe(
     Effect.flatMap((raw) =>
@@ -468,7 +469,7 @@ function readStateResultEffect(file = statePath()) {
  */
 function readRawStateEffect(file = statePath()) {
   return Effect.tryPromise({
-    try: () => readFile(file, "utf8"),
+    try: () => readStateFile(file),
     catch: (cause) => new StateReadError({ cause }),
   }).pipe(
     Effect.catchAll((error) =>
@@ -499,7 +500,7 @@ function quarantineStateEffect(file: string, content: string) {
 function verifyRecoverySourceEffect(file: string, expectedContent: string, quarantineFile: string) {
   return Effect.promise(async () => {
     try {
-      return (await readFile(file, "utf8")) === expectedContent
+      return (await readStateFile(file)) === expectedContent
     } catch (error) {
       if (!isMissingStateFile(error)) {
         try {

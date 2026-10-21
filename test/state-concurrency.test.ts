@@ -64,4 +64,6 @@ test("two plugin instances writing the shared state file do not lose each other'
     else process.env.OPENCODE_GOAL_STATE_PATH = previous
     await rm(dir, { recursive: true, force: true })
   }
-})
+  // The probes spawn processes and write the state file hundreds of times, so
+  // the test needs more than Bun's default per-test timeout.
+}, 60_000)
