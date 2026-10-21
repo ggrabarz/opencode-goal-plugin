@@ -2988,3 +2988,37 @@ test("V2 a failing event does not stop the event consumer", async () => {
   mock.stream.end()
   await cleanup()
 })
+
+test("V2 a scheduled continuation that fails is reported instead of rejecting", async () => {
+  // The scheduled continuation runs in a timer callback. A callback that
+  // rejects becomes an unhandled rejection, which the host reports as a
+  // crash, so the failure has to be caught and reported instead.
+  const rejections: unknown[] = []
+  const onUnhandled = (reason: unknown) => rejections.push(reason)
+  process.on("unhandledRejection", onUnhandled)
+  const mock = makeMockContext({ min_continue_interval_seconds: 3, max_prompt_failures: 5 })
+  mock.session.prompt = async () => {
+    throw new Error("network connection failed")
+  }
+  const cleanup = await setupPlugin(mock as never)
+  try {
+    await createGoalViaV2Tool(mock, "report a failed scheduled continuation")
+    mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
+    mock.stream.push({
+      type: "session.execution.failed",
+      created: 2,
+      data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+    })
+    // The failure is recorded and the retry is scheduled.
+    await waitFor(async () => (await getGoal("ses_v2"))?.continuationFailures === 1)
+    // The retry reads the goal state. A state file that cannot be decoded makes
+    // the timer fail.
+    await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "{ not json", "utf8")
+    await waitFor(async () => (await readFile(join(dir, "goal-plugin.log"), "utf8").catch(() => "")).includes("Scheduled continuation failed"), 8000)
+    expect(rejections).toHaveLength(0)
+  } finally {
+    process.off("unhandledRejection", onUnhandled)
+    mock.stream.end()
+    await cleanup()
+  }
+})
