@@ -4256,12 +4256,16 @@ var server = async ({ client }, options) => {
       }
     },
     async "tool.execute.before"(input) {
-      taskTracker.noteTaskCall(input);
-      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined;
-      const callID = typeof input?.callID === "string" ? input.callID : undefined;
-      if (sessionID && callID) {
-        const goal = await getGoalInternal(sessionID);
-        toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
+      try {
+        taskTracker.noteTaskCall(input);
+        const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined;
+        const callID = typeof input?.callID === "string" ? input.callID : undefined;
+        if (sessionID && callID) {
+          const goal = await getGoalInternal(sessionID);
+          toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
+        }
+      } catch (error) {
+        v2ErrorLog("Failed to run the tool.execute.before hook", error);
       }
     },
     async "command.execute.before"(input, output) {
@@ -4293,37 +4297,41 @@ var server = async ({ client }, options) => {
       clearTurnWatchdog(input.sessionID);
     },
     async "tool.execute.after"(input, output) {
-      taskTracker.noteTaskOutput(input, output);
-      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined;
-      const callID = typeof input?.callID === "string" ? input.callID : undefined;
-      const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined;
-      const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined;
-      if (attemptKey)
-        toolAttempts.delete(attemptKey);
-      if (!sessionID)
-        return;
-      if (GOAL_PLAN_TOOLS.has(input.tool)) {
-        const goal = await getGoal(sessionID);
-        if (goal || input.tool === "clear_goal")
-          output.metadata = { ...output.metadata, ...acpPlanMetadata(goal) };
-      }
-      if (typeof input?.tool === "string" && NON_PROGRESS_TOOLS.has(input.tool.toLowerCase()))
-        return;
-      const toolResult = output;
-      if (toolOutputFailed(toolResult))
-        return;
-      const text = typeof toolResult.output === "string" ? toolResult.output : undefined;
-      if (!text)
-        return;
-      const before = await getGoalInternal(sessionID);
-      const scheduled = scheduledContinuations.get(sessionID);
-      const hasFailureEpisode = Boolean(before && (before.continuationFailures > 0 || before.pendingAttempt != null));
-      if (!before || !hasFailureEpisode && scheduled?.purpose !== "recovery")
-        return;
-      const progressed = await recordToolProgress(sessionID, text, expectedAttemptID);
-      if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
-        locallyDeliveredPendingSessions.delete(sessionID);
-        cancelScheduledContinuation(sessionID);
+      try {
+        taskTracker.noteTaskOutput(input, output);
+        const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined;
+        const callID = typeof input?.callID === "string" ? input.callID : undefined;
+        const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined;
+        const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined;
+        if (attemptKey)
+          toolAttempts.delete(attemptKey);
+        if (!sessionID)
+          return;
+        if (GOAL_PLAN_TOOLS.has(input.tool)) {
+          const goal = await getGoal(sessionID);
+          if (goal || input.tool === "clear_goal")
+            output.metadata = { ...output.metadata, ...acpPlanMetadata(goal) };
+        }
+        if (typeof input?.tool === "string" && NON_PROGRESS_TOOLS.has(input.tool.toLowerCase()))
+          return;
+        const toolResult = output;
+        if (toolOutputFailed(toolResult))
+          return;
+        const text = typeof toolResult.output === "string" ? toolResult.output : undefined;
+        if (!text)
+          return;
+        const before = await getGoalInternal(sessionID);
+        const scheduled = scheduledContinuations.get(sessionID);
+        const hasFailureEpisode = Boolean(before && (before.continuationFailures > 0 || before.pendingAttempt != null));
+        if (!before || !hasFailureEpisode && scheduled?.purpose !== "recovery")
+          return;
+        const progressed = await recordToolProgress(sessionID, text, expectedAttemptID);
+        if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
+          locallyDeliveredPendingSessions.delete(sessionID);
+          cancelScheduledContinuation(sessionID);
+        }
+      } catch (error) {
+        v2ErrorLog("Failed to run the tool.execute.after hook", error);
       }
     },
     async "chat.message"(input, output) {
@@ -4490,6 +4498,15 @@ var server = async ({ client }, options) => {
     }
   };
 };
+function guardToolHook(what, callback) {
+  return async (input) => {
+    try {
+      await callback(input);
+    } catch (error) {
+      v2ErrorLog(`Failed to run ${what}`, error);
+    }
+  };
+}
 function v2ErrorLog(message, error) {
   try {
     console.error(`[opencode-goal-plugin] ${message}:`, describeError(error));
@@ -5406,7 +5423,7 @@ async function setupV2(context) {
     for (const tool of goalToolsV2(goalServices))
       draft.add(tool);
   }));
-  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", async (input) => {
+  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", guardToolHook("the execute.before hook", async (input) => {
     taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id });
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
     if (sessionID)
@@ -5416,8 +5433,8 @@ async function setupV2(context) {
       const goal = await getGoalInternal(sessionID);
       toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
     }
-  }));
-  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", async (input) => {
+  })));
+  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", guardToolHook("the execute.after hook", async (input) => {
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
     const callID = typeof input.id === "string" ? input.id : undefined;
     const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined;
@@ -5451,7 +5468,7 @@ async function setupV2(context) {
       locallyDeliveredPendingSessions.delete(sessionID);
       cancelScheduledContinuation(sessionID);
     }
-  }));
+  })));
   const reminder = systemReminder(locale);
   const ensureSystemReminder = (system) => {
     if (system.some((part) => part.type === "text" && part.text.includes(reminder)))

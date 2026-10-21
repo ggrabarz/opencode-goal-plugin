@@ -2168,12 +2168,19 @@ const server: Plugin = async ({ client }, options?: Options) => {
       },
     },
     async "tool.execute.before"(input) {
-      taskTracker.noteTaskCall(input as { tool?: unknown; sessionID?: unknown; callID?: unknown })
-      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
-      const callID = typeof input?.callID === "string" ? input.callID : undefined
-      if (sessionID && callID) {
-        const goal = await getGoalInternal(sessionID)
-        toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
+      try {
+        taskTracker.noteTaskCall(input as { tool?: unknown; sessionID?: unknown; callID?: unknown })
+        const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
+        const callID = typeof input?.callID === "string" ? input.callID : undefined
+        if (sessionID && callID) {
+          const goal = await getGoalInternal(sessionID)
+          toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
+        }
+      } catch (error) {
+        // A tool hook runs on every tool call. A state failure inside it must
+        // not reject the hook, or the host reports the user's own tool call as
+        // failed.
+        v2ErrorLog("Failed to run the tool.execute.before hook", error)
       }
     },
     async "command.execute.before"(input, output) {
@@ -2199,38 +2206,45 @@ const server: Plugin = async ({ client }, options?: Options) => {
       clearTurnWatchdog(input.sessionID)
     },
     async "tool.execute.after"(input, output) {
-      taskTracker.noteTaskOutput(
-        input as { tool?: unknown; sessionID?: unknown; callID?: unknown },
-        output as { output?: unknown },
-      )
-      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
-      const callID = typeof input?.callID === "string" ? input.callID : undefined
-      const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined
-      const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined
-      if (attemptKey) toolAttempts.delete(attemptKey)
-      if (!sessionID) return
-      if (GOAL_PLAN_TOOLS.has(input.tool)) {
-        const goal = await getGoal(sessionID)
-        if (goal || input.tool === "clear_goal") output.metadata = { ...output.metadata, ...acpPlanMetadata(goal) }
-      }
-      if (typeof input?.tool === "string" && NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
-      const toolResult = output as { output?: unknown; error?: unknown }
-      // A successful tool output is real progress: it resolves any pending
-      // continuation and clears the prompt-failure counter. Failed tool
-      // outputs leave the failure counter and pending window untouched.
-      if (toolOutputFailed(toolResult)) return
-      const text = typeof toolResult.output === "string" ? toolResult.output : undefined
-      if (!text) return
-      const before = await getGoalInternal(sessionID)
-      const scheduled = scheduledContinuations.get(sessionID)
-      const hasFailureEpisode = Boolean(
-        before && (before.continuationFailures > 0 || before.pendingAttempt != null),
-      )
-      if (!before || (!hasFailureEpisode && scheduled?.purpose !== "recovery")) return
-      const progressed = await recordToolProgress(sessionID, text, expectedAttemptID)
-      if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
-        locallyDeliveredPendingSessions.delete(sessionID)
-        cancelScheduledContinuation(sessionID)
+      try {
+        taskTracker.noteTaskOutput(
+          input as { tool?: unknown; sessionID?: unknown; callID?: unknown },
+          output as { output?: unknown },
+        )
+        const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
+        const callID = typeof input?.callID === "string" ? input.callID : undefined
+        const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined
+        const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined
+        if (attemptKey) toolAttempts.delete(attemptKey)
+        if (!sessionID) return
+        if (GOAL_PLAN_TOOLS.has(input.tool)) {
+          const goal = await getGoal(sessionID)
+          if (goal || input.tool === "clear_goal") output.metadata = { ...output.metadata, ...acpPlanMetadata(goal) }
+        }
+        if (typeof input?.tool === "string" && NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
+        const toolResult = output as { output?: unknown; error?: unknown }
+        // A successful tool output is real progress: it resolves any pending
+        // continuation and clears the prompt-failure counter. Failed tool
+        // outputs leave the failure counter and pending window untouched.
+        if (toolOutputFailed(toolResult)) return
+        const text = typeof toolResult.output === "string" ? toolResult.output : undefined
+        if (!text) return
+        const before = await getGoalInternal(sessionID)
+        const scheduled = scheduledContinuations.get(sessionID)
+        const hasFailureEpisode = Boolean(
+          before && (before.continuationFailures > 0 || before.pendingAttempt != null),
+        )
+        if (!before || (!hasFailureEpisode && scheduled?.purpose !== "recovery")) return
+        const progressed = await recordToolProgress(sessionID, text, expectedAttemptID)
+        if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
+          locallyDeliveredPendingSessions.delete(sessionID)
+          cancelScheduledContinuation(sessionID)
+        }
+      } catch (error) {
+        // A tool hook runs on every tool call. A state failure inside it must
+        // not reject the hook, or the host reports the user's own tool call as
+        // failed.
+        v2ErrorLog("Failed to run the tool.execute.after hook", error)
       }
     },
     async "chat.message"(input, output) {
@@ -2411,6 +2425,24 @@ const server: Plugin = async ({ client }, options?: Options) => {
         v2ErrorLog("Failed to handle a V1 event", error)
       }
     },
+  }
+}
+
+/**
+ * Guard a tool hook callback.
+ *
+ * A tool hook runs on every tool call, and the hook reads and writes the goal
+ * state. A state failure inside it must not reject the hook, or the host
+ * reports the user's own tool call as failed - the goal bookkeeping is not
+ * worth failing the command the user ran.
+ */
+function guardToolHook<TInput>(what: string, callback: (input: TInput) => Promise<void>) {
+  return async (input: TInput) => {
+    try {
+      await callback(input)
+    } catch (error) {
+      v2ErrorLog(`Failed to run ${what}`, error)
+    }
   }
 }
 
@@ -3467,7 +3499,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     }),
   )
 
-  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", async (input) => {
+  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", guardToolHook("the execute.before hook", async (input) => {
       taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id })
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
       // Tool execution only happens in the session's owning location.
@@ -3477,10 +3509,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         const goal = await getGoalInternal(sessionID)
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
       }
-    }),
+    })),
   )
 
-  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", async (input) => {
+  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", guardToolHook("the execute.after hook", async (input) => {
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
       const callID = typeof input.id === "string" ? input.id : undefined
       const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined
@@ -3514,7 +3546,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         locallyDeliveredPendingSessions.delete(sessionID)
         cancelScheduledContinuation(sessionID)
       }
-    }),
+    })),
   )
 
   const reminder = systemReminder(locale)
