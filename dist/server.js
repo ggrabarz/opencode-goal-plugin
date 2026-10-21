@@ -504,6 +504,55 @@ function reportPluginError(message, error) {
   } catch {}
 }
 
+// src/state-lock.ts
+import { open as open2, stat, unlink as unlink2 } from "fs/promises";
+var LOCK_STALE_MS = 30000;
+var LOCK_TIMEOUT_MS = 5000;
+var LOCK_RETRY_MS = 20;
+function stateLockPath(stateFile) {
+  return `${stateFile}.lock`;
+}
+async function acquireStateLock(lockPath, options = {}) {
+  const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
+  const staleMs = options.staleMs ?? LOCK_STALE_MS;
+  const deadline = Date.now() + timeoutMs;
+  for (;; ) {
+    try {
+      const handle = await open2(lockPath, "wx");
+      try {
+        await handle.close();
+      } catch {}
+      return {
+        held: true,
+        release: async () => {
+          try {
+            await unlink2(lockPath);
+          } catch {}
+        }
+      };
+    } catch (error) {
+      const code = error?.code;
+      const contended = code === "EEXIST" || code === "EPERM" || code === "EACCES";
+      if (!contended) {
+        reportPluginError(`Could not create the state lock at ${lockPath}`, error instanceof Error ? error : new Error(String(code ?? "unknown error")));
+        return { held: false, release: async () => {} };
+      }
+      try {
+        const stats = await stat(lockPath);
+        if (Date.now() - stats.mtimeMs > staleMs) {
+          await unlink2(lockPath);
+          continue;
+        }
+      } catch {}
+      if (Date.now() >= deadline) {
+        reportPluginError(`Gave up waiting for the state lock at ${lockPath}`);
+        return { held: false, release: async () => {} };
+      }
+      await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
+    }
+  }
+}
+
 // src/state.ts
 class StateReadError extends Data.TaggedError("StateReadError") {
 }
@@ -687,7 +736,13 @@ function readStateResultEffect(file = statePath()) {
   }).pipe(Effect.flatMap((raw) => Effect.try({
     try: () => parseStateText(raw, file),
     catch: (cause) => new StateDecodeError({ cause })
-  })), Effect.flatMap(({ value, recoveryContent }) => decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent })))), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed({ state: emptyState(), recoveryContent: null }) : Effect.fail(error)));
+  }).pipe(Effect.flatMap(({ value, recoveryContent }) => decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent, raw })))))), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed({ state: emptyState(), recoveryContent: null, raw: null }) : Effect.fail(error)));
+}
+function readRawStateEffect(file = statePath()) {
+  return Effect.tryPromise({
+    try: () => readFile(file, "utf8"),
+    catch: (cause) => new StateReadError({ cause })
+  }).pipe(Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed(null) : Effect.fail(error)));
 }
 function readStateEffect(file = statePath()) {
   return readStateResultEffect(file).pipe(Effect.map(({ state }) => state));
@@ -733,6 +788,7 @@ async function readState() {
   return Effect.runPromise(readStateEffect());
 }
 var mutationQueue = Promise.resolve();
+var MAX_MUTATION_ATTEMPTS = 8;
 function enqueueMutation(operation) {
   const current = mutationQueue.then(operation, operation);
   mutationQueue = current.then(() => {
@@ -743,53 +799,70 @@ function enqueueMutation(operation) {
   return current;
 }
 async function mutate(fn) {
-  return enqueueMutation(() => {
+  return enqueueMutation(async () => {
     const file = statePath();
-    return Effect.runPromise(Effect.gen(function* () {
-      const { state, recoveryContent } = yield* readStateResultEffect(file);
-      const result = yield* Effect.tryPromise({
-        try: () => Promise.resolve(fn(state)),
-        catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
-      });
-      if (recoveryContent != null) {
-        const quarantine = yield* quarantineStateEffect(file, recoveryContent);
-        if (quarantine.error != null) {
-          const notice = {
-            stateFile: file,
-            quarantineFile: quarantine.quarantineFile,
-            outcome: "quarantineFailed",
-            error: quarantine.error
-          };
-          try {
-            console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
-          } catch {}
-          reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error);
-          notifyStateRecovery(notice);
-        } else {
-          const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile);
-          if (!unchanged) {
-            const message = "goal state changed while recovery was being quarantined; refusing to overwrite it";
-            notifyStateRecovery({
-              stateFile: file,
-              quarantineFile: quarantine.quarantineFile,
-              outcome: "sourceChanged",
-              error: message
-            });
-            return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }));
-          }
-          try {
-            console.warn(`[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`);
-          } catch {}
-          notifyStateRecovery({
-            stateFile: file,
-            quarantineFile: quarantine.quarantineFile,
-            outcome: "quarantined"
+    const lock = await acquireStateLock(stateLockPath(file));
+    try {
+      return await Effect.runPromise(Effect.gen(function* () {
+        let lastState = null;
+        let lastResult;
+        for (let attempt = 0;attempt < MAX_MUTATION_ATTEMPTS; attempt++) {
+          const { state, recoveryContent, raw } = yield* readStateResultEffect(file);
+          const result = yield* Effect.tryPromise({
+            try: () => Promise.resolve(fn(state)),
+            catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
           });
+          lastState = state;
+          lastResult = result;
+          if (recoveryContent != null) {
+            const quarantine = yield* quarantineStateEffect(file, recoveryContent);
+            if (quarantine.error != null) {
+              const notice = {
+                stateFile: file,
+                quarantineFile: quarantine.quarantineFile,
+                outcome: "quarantineFailed",
+                error: quarantine.error
+              };
+              try {
+                console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
+              } catch {}
+              reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error);
+              notifyStateRecovery(notice);
+            } else {
+              const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile);
+              if (!unchanged) {
+                const message = "goal state changed while recovery was being quarantined; refusing to overwrite it";
+                notifyStateRecovery({
+                  stateFile: file,
+                  quarantineFile: quarantine.quarantineFile,
+                  outcome: "sourceChanged",
+                  error: message
+                });
+                return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }));
+              }
+              try {
+                console.warn(`[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`);
+              } catch {}
+              notifyStateRecovery({
+                stateFile: file,
+                quarantineFile: quarantine.quarantineFile,
+                outcome: "quarantined"
+              });
+            }
+          }
+          const current = yield* readRawStateEffect(file);
+          if (current !== raw)
+            continue;
+          yield* writeStateEffect(state, file);
+          return result;
         }
-      }
-      yield* writeStateEffect(state, file);
-      return result;
-    }));
+        if (lastState)
+          yield* writeStateEffect(lastState, file);
+        return lastResult;
+      }));
+    } finally {
+      await lock.release();
+    }
   });
 }
 var DEFAULT_MAX_OBJECTIVE_CHARS = 1e5;
