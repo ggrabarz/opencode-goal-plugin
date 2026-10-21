@@ -292,7 +292,7 @@ function goalPlanEntries(plan) {
 
 // src/state.ts
 import { randomUUID as randomUUID2 } from "crypto";
-import { mkdir, readFile } from "fs/promises";
+import { mkdir } from "fs/promises";
 import { dirname as dirname3 } from "path";
 import { Data, Effect, Schema } from "effect-goal-state";
 
@@ -570,6 +570,46 @@ async function acquireStateLock(lockPath, options = {}) {
   }
 }
 
+// src/state-read.ts
+import { readFile } from "fs/promises";
+var READ_ATTEMPTS = 5;
+var READ_RETRY_DELAY_MS = 10;
+var MISSING_READ_ATTEMPTS = 3;
+var MISSING_READ_RETRY_DELAY_MS = 2;
+var defaultStateReadOps = {
+  platform: process.platform,
+  readFile: (path) => readFile(path, "utf8"),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+};
+function isTransientReadError(error, platform) {
+  const code = error?.code;
+  if (code === "ENOENT")
+    return true;
+  if (platform !== "win32")
+    return false;
+  return code === "EPERM" || code === "EACCES" || code === "EBUSY";
+}
+async function readStateFile(file, ops = defaultStateReadOps) {
+  let missingAttempts = 0;
+  for (let attempt = 1;; attempt++) {
+    try {
+      return await ops.readFile(file);
+    } catch (error) {
+      const code = error?.code;
+      if (code === "ENOENT") {
+        missingAttempts += 1;
+        if (missingAttempts >= MISSING_READ_ATTEMPTS)
+          throw error;
+        await ops.sleep(MISSING_READ_RETRY_DELAY_MS);
+        continue;
+      }
+      if (attempt >= READ_ATTEMPTS || !isTransientReadError(error, ops.platform))
+        throw error;
+      await ops.sleep(READ_RETRY_DELAY_MS);
+    }
+  }
+}
+
 // src/state.ts
 class StateReadError extends Data.TaggedError("StateReadError") {
 }
@@ -748,7 +788,7 @@ function decodeState(value) {
 }
 function readStateResultEffect(file = statePath()) {
   return Effect.tryPromise({
-    try: () => readFile(file, "utf8"),
+    try: () => readStateFile(file),
     catch: (cause) => new StateReadError({ cause })
   }).pipe(Effect.flatMap((raw) => Effect.try({
     try: () => parseStateText(raw, file),
@@ -757,7 +797,7 @@ function readStateResultEffect(file = statePath()) {
 }
 function readRawStateEffect(file = statePath()) {
   return Effect.tryPromise({
-    try: () => readFile(file, "utf8"),
+    try: () => readStateFile(file),
     catch: (cause) => new StateReadError({ cause })
   }).pipe(Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed(null) : Effect.fail(error)));
 }
@@ -779,7 +819,7 @@ function quarantineStateEffect(file, content) {
 function verifyRecoverySourceEffect(file, expectedContent, quarantineFile) {
   return Effect.promise(async () => {
     try {
-      return await readFile(file, "utf8") === expectedContent;
+      return await readStateFile(file) === expectedContent;
     } catch (error) {
       if (!isMissingStateFile(error)) {
         try {
