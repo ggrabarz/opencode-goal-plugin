@@ -181,7 +181,7 @@ type MockContext = {
   ui: {
     dialog: {
       set: (options: { size?: string; centered?: boolean }) => void
-      alert: (options: { title: string; message: string }) => Promise<void>
+      show: (render: () => unknown) => void
       select: (options: { title: string; placeholder: string; options: readonly { title: string; value: string }[] }) => Promise<string | undefined>
       clear: () => void
     }
@@ -206,7 +206,7 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
   layers: Array<() => MockKeymapLayer>
   promptCalls: Array<{ sessionID: string; text: string }>
   toasts: Array<{ title?: string; message: string; variant?: string; duration?: number }>
-  alertCalls: Array<{ title: string; message: string }>
+  shown: Array<() => unknown>
   selectCalls: Array<{ title: string; placeholder: string; options: readonly { title: string; value: string }[] }>
   setMessages: (messages: SessionMessageInfo[]) => void
   setRoute: (route: { type: string; sessionID?: string }) => void
@@ -216,7 +216,7 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
   const layers: Array<() => MockKeymapLayer> = []
   const promptCalls: Array<{ sessionID: string; text: string }> = []
   const toasts: Array<{ title?: string; message: string; variant?: string; duration?: number }> = []
-  const alertCalls: Array<{ title: string; message: string }> = []
+  const shown: Array<() => unknown> = []
   const selectCalls: Array<{ title: string; placeholder: string; options: readonly { title: string; value: string }[] }> = []
   const [messages, setMessages] = createSignal<SessionMessageInfo[]>([])
   let route: { type: string; sessionID?: string } = { type: "home" }
@@ -285,8 +285,8 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
     ui: {
       dialog: {
         set() {},
-        async alert(options: { title: string; message: string }) {
-          alertCalls.push(options)
+        show(render: () => unknown) {
+          shown.push(render)
         },
         async select(options) {
           selectCalls.push(options)
@@ -324,7 +324,7 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
     layers,
     promptCalls,
     toasts,
-    alertCalls,
+    shown,
     selectCalls,
     setMessages(next) {
       setMessages(next)
@@ -981,7 +981,7 @@ test("V2 the input box icon follows the goal state in the same cycle as the side
 })
 
 test("V2 the goal state popup is bound to a key and shows what the sidebar shows", async () => {
-  const { mock, slots, layers, setMessages, setRoute, alertCalls } = makeMockContext()
+  const { mock, slots, layers, setMessages, setRoute, shown } = makeMockContext()
   const cleanup = setupTuiV2(mock as never)
   const sidebar = slots.get("sidebar.content")
   const app = slots.get("app")
@@ -1008,17 +1008,38 @@ test("V2 the goal state popup is bound to a key and shows what the sidebar shows
     expect(command?.palette).toBe(true)
     command?.run()
 
-    await waitFor(() => alertCalls.length === 1)
-    const message = alertCalls[0]?.message ?? ""
-    expect(message).toContain("Status: paused")
-    expect(message).toContain("ship the milestone")
-    // Every line of the popup is a line of the sidebar: the popup shows the
-    // same state, not a reduced view of it.
-    for (const line of message.split("\n")) {
-      expect(frame).toContain(line)
+    await waitFor(() => shown.length === 1)
+    const popup = await testRender(() => shown[0]?.() as never, { width: 80, height: 20 })
+    let popupDestroyed = false
+    try {
+      await popup.renderOnce()
+      const popupFrame = popup.captureCharFrame()
+      // Every line of the popup is a line of the sidebar: the popup shows the
+      // same state, not a reduced view of it.
+      expect(popupFrame).toContain("Status: paused")
+      expect(popupFrame).toContain("ship the milestone")
+      for (const line of popupFrame.split("\n")) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        // The header of the popup and its hint are the popup's own; the state
+        // lines below them are the lines of the sidebar.
+        if (trimmed === "esc to close") continue
+        if (trimmed.startsWith(goalStatusGlyph("paused"))) continue
+        expect(frame).toContain(trimmed)
+      }
+      // The status is coloured, the labels are quiet and the values are plain.
+      const spans = popup.captureSpans().lines.flatMap((line) => line.spans)
+      const statusSpan = spans.find((span) => span.text.includes("paused"))
+      expect(statusSpan).toBeDefined()
+      const labelSpan = spans.find((span) => span.text.includes("Status:"))
+      expect(labelSpan?.fg.equals(mock.theme.text.muted)).toBe(true)
+      // The header carries the glyph of the status.
+      expect(popupFrame).toContain(goalStatusGlyph("paused"))
+      popup.renderer.destroy()
+      popupDestroyed = true
+    } finally {
+      if (!popupDestroyed) popup.renderer.destroy()
     }
-    // The title carries the glyph of the status the popup shows.
-    expect(alertCalls[0]?.title).toContain(goalStatusGlyph("paused"))
 
     appRender.renderer.destroy()
     sidebarRender.renderer.destroy()
@@ -1033,7 +1054,7 @@ test("V2 the goal state popup is bound to a key and shows what the sidebar shows
 })
 
 test("V2 the goal state popup toasts a warning when no session is open", async () => {
-  const { mock, slots, layers, toasts, setRoute, alertCalls } = makeMockContext()
+  const { mock, slots, layers, toasts, setRoute, shown } = makeMockContext()
   const cleanup = setupTuiV2(mock as never)
   setRoute({ type: "home" })
   const app = slots.get("app")
@@ -1048,7 +1069,7 @@ test("V2 the goal state popup toasts a warning when no session is open", async (
 
     expect(toasts[0]?.message).toContain("Open a session")
     expect(toasts[0]?.variant).toBe("warning")
-    expect(alertCalls).toHaveLength(0)
+    expect(shown).toHaveLength(0)
 
     setup.renderer.destroy()
     destroyed = true
@@ -1060,7 +1081,7 @@ test("V2 the goal state popup toasts a warning when no session is open", async (
 
 test("V2 the goal state popup toasts the failure when the dialog cannot be shown", async () => {
   const { mock, slots, layers, setMessages, setRoute, toasts } = makeMockContext()
-  mock.ui.dialog.alert = async () => {
+  mock.ui.dialog.show = () => {
     throw new Error("the popup could not be opened")
   }
   const cleanup = setupTuiV2(mock as never)

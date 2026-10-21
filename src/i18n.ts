@@ -57,6 +57,7 @@ export type GoalMessages = {
     commandDescription: string
     stateTitle: string
     stateDescription: string
+    closeHint: string
     refresh: string
     refreshDescription: string
     history: string
@@ -183,6 +184,7 @@ const EN_MESSAGES: GoalMessages = {
     commandDescription: "View, pause, resume, or clear the long-running session goal",
     stateTitle: "Goal state",
     stateDescription: "Show the goal state in a popup",
+    closeHint: "esc to close",
     refresh: "Refresh",
     refreshDescription: "Ask the agent to read the current goal state",
     history: "History",
@@ -288,6 +290,7 @@ const ZH_CN_MESSAGES: GoalMessages = {
     commandDescription: "查看、暂停、继续或清除当前会话的长期目标",
     stateTitle: "目标状态",
     stateDescription: "在弹窗中显示目标状态",
+    closeHint: "esc 关闭",
     refresh: "刷新",
     refreshDescription: "让 Agent 读取当前目标状态",
     history: "历史",
