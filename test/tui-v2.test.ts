@@ -137,6 +137,7 @@ type MockKeymapLayer = {
     description?: string
     group?: string
     palette?: true
+    bind?: string
     run: (input?: string, event?: unknown) => void | false | Promise<void>
   }[]
   bindings?: readonly string[]
@@ -179,7 +180,8 @@ type MockContext = {
   }
   ui: {
     dialog: {
-      set: (options: { size?: string }) => void
+      set: (options: { size?: string; centered?: boolean }) => void
+      alert: (options: { title: string; message: string }) => Promise<void>
       select: (options: { title: string; placeholder: string; options: readonly { title: string; value: string }[] }) => Promise<string | undefined>
       clear: () => void
     }
@@ -204,6 +206,7 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
   layers: Array<() => MockKeymapLayer>
   promptCalls: Array<{ sessionID: string; text: string }>
   toasts: Array<{ title?: string; message: string; variant?: string; duration?: number }>
+  alertCalls: Array<{ title: string; message: string }>
   selectCalls: Array<{ title: string; placeholder: string; options: readonly { title: string; value: string }[] }>
   setMessages: (messages: SessionMessageInfo[]) => void
   setRoute: (route: { type: string; sessionID?: string }) => void
@@ -213,6 +216,7 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
   const layers: Array<() => MockKeymapLayer> = []
   const promptCalls: Array<{ sessionID: string; text: string }> = []
   const toasts: Array<{ title?: string; message: string; variant?: string; duration?: number }> = []
+  const alertCalls: Array<{ title: string; message: string }> = []
   const selectCalls: Array<{ title: string; placeholder: string; options: readonly { title: string; value: string }[] }> = []
   const [messages, setMessages] = createSignal<SessionMessageInfo[]>([])
   let route: { type: string; sessionID?: string } = { type: "home" }
@@ -281,6 +285,9 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
     ui: {
       dialog: {
         set() {},
+        async alert(options: { title: string; message: string }) {
+          alertCalls.push(options)
+        },
         async select(options) {
           selectCalls.push(options)
           return undefined
@@ -317,6 +324,7 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
     layers,
     promptCalls,
     toasts,
+    alertCalls,
     selectCalls,
     setMessages(next) {
       setMessages(next)
@@ -852,6 +860,114 @@ test("V2 palette command toasts a warning when no session is open", async () => 
     expect(toasts[0]?.variant).toBe("warning")
     expect(selectCalls).toHaveLength(0)
     expect(promptCalls).toHaveLength(0)
+
+    setup.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) setup.renderer.destroy()
+    cleanup()
+  }
+})
+
+test("V2 the goal state popup is bound to a key and shows what the sidebar shows", async () => {
+  const { mock, slots, layers, setMessages, setRoute, alertCalls } = makeMockContext()
+  const cleanup = setupTuiV2(mock as never)
+  const sidebar = slots.get("sidebar.content")
+  const app = slots.get("app")
+  setMessages([
+    assistantMessage("created", [
+      goalTool("create_goal", JSON.stringify({ goal: goal({ objective: "ship the milestone", status: "paused" }) })),
+    ]),
+  ])
+  setRoute({ type: "session", sessionID: "session" })
+
+  const sidebarRender = await testRender(() => sidebar?.({ sessionID: "session" }) as never, { width: 80, height: 20 })
+  const appRender = await testRender(() => app?.({ sessionID: "" }) as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await sidebarRender.renderOnce()
+    await appRender.renderOnce()
+    const frame = sidebarRender.captureCharFrame()
+
+    const command = layers[0]?.()?.commands?.find((candidate) => candidate.id === "goal.state")
+    expect(command).toBeDefined()
+    // The popup opens from a key, the way the OpenRouter limits plugin opens
+    // its popup from f3.
+    expect(command?.bind).toBe("f4")
+    expect(command?.palette).toBe(true)
+    command?.run()
+
+    await waitFor(() => alertCalls.length === 1)
+    const message = alertCalls[0]?.message ?? ""
+    expect(message).toContain("Status: paused")
+    expect(message).toContain("ship the milestone")
+    // Every line of the popup is a line of the sidebar: the popup shows the
+    // same state, not a reduced view of it.
+    for (const line of message.split("\n")) {
+      expect(frame).toContain(line)
+    }
+    // The title carries the glyph of the status the popup shows.
+    expect(alertCalls[0]?.title).toContain(goalStatusGlyph("paused"))
+
+    appRender.renderer.destroy()
+    sidebarRender.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) {
+      appRender.renderer.destroy()
+      sidebarRender.renderer.destroy()
+    }
+    cleanup()
+  }
+})
+
+test("V2 the goal state popup toasts a warning when no session is open", async () => {
+  const { mock, slots, layers, toasts, setRoute, alertCalls } = makeMockContext()
+  const cleanup = setupTuiV2(mock as never)
+  setRoute({ type: "home" })
+  const app = slots.get("app")
+
+  const setup = await testRender(() => app?.({ sessionID: "" }) as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await setup.renderOnce()
+    const command = layers[0]?.()?.commands?.find((candidate) => candidate.id === "goal.state")
+    command?.run()
+    await waitFor(() => toasts.length === 1)
+
+    expect(toasts[0]?.message).toContain("Open a session")
+    expect(toasts[0]?.variant).toBe("warning")
+    expect(alertCalls).toHaveLength(0)
+
+    setup.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) setup.renderer.destroy()
+    cleanup()
+  }
+})
+
+test("V2 the goal state popup toasts the failure when the dialog cannot be shown", async () => {
+  const { mock, slots, layers, setMessages, setRoute, toasts } = makeMockContext()
+  mock.ui.dialog.alert = async () => {
+    throw new Error("the popup could not be opened")
+  }
+  const cleanup = setupTuiV2(mock as never)
+  const app = slots.get("app")
+  setMessages([
+    assistantMessage("created", [goalTool("create_goal", JSON.stringify({ goal: goal({ objective: "popup me" }) }))]),
+  ])
+  setRoute({ type: "session", sessionID: "session" })
+
+  const setup = await testRender(() => app?.({ sessionID: "" }) as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await setup.renderOnce()
+    const command = layers[0]?.()?.commands?.find((candidate) => candidate.id === "goal.state")
+    command?.run()
+
+    await waitFor(() => toasts.length === 1)
+    expect(toasts[0]?.message).toContain("the popup could not be opened")
 
     setup.renderer.destroy()
     destroyed = true

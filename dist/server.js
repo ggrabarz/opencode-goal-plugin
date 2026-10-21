@@ -1907,6 +1907,8 @@ var EN_MESSAGES = {
   tui: {
     title: "Goal",
     commandDescription: "View, pause, resume, or clear the long-running session goal",
+    stateTitle: "Goal state",
+    stateDescription: "Show the goal state in a popup",
     refresh: "Refresh",
     refreshDescription: "Ask the agent to read the current goal state",
     history: "History",
@@ -1994,6 +1996,8 @@ var ZH_CN_MESSAGES = {
   tui: {
     title: "\u76EE\u6807",
     commandDescription: "\u67E5\u770B\u3001\u6682\u505C\u3001\u7EE7\u7EED\u6216\u6E05\u9664\u5F53\u524D\u4F1A\u8BDD\u7684\u957F\u671F\u76EE\u6807",
+    stateTitle: "\u76EE\u6807\u72B6\u6001",
+    stateDescription: "\u5728\u5F39\u7A97\u4E2D\u663E\u793A\u76EE\u6807\u72B6\u6001",
     refresh: "\u5237\u65B0",
     refreshDescription: "\u8BA9 Agent \u8BFB\u53D6\u5F53\u524D\u76EE\u6807\u72B6\u6001",
     history: "\u5386\u53F2",
