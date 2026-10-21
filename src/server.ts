@@ -1,4 +1,4 @@
-import type { Config, Plugin } from "@opencode-ai/plugin"
+import type { Config, Hooks, Plugin } from "@opencode-ai/plugin"
 import type * as PluginV2 from "@opencode/plugin"
 import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
 import type { Tool as ToolSchema } from "@opencode/schema/tool"
@@ -2007,7 +2007,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
     }
   }
 
-  return {
+  // Every hook the V1 API exposes runs on the host's critical paths, and each
+  // of them reads and writes the goal state. They are guarded together so a
+  // state failure in one of them cannot reject the hook the host is waiting on.
+  return guardHooks({
     async dispose() {
       disposed = true
       stopStateRecoveryReporting()
@@ -2425,25 +2428,52 @@ const server: Plugin = async ({ client }, options?: Options) => {
         v2ErrorLog("Failed to handle a V1 event", error)
       }
     },
+  })
+}
+
+/**
+ * Guard a host hook callback.
+ *
+ * A hook runs on the host's critical paths - every tool call, every prompt,
+ * every message, every compaction - and the hook reads and writes the goal
+ * state. A state failure inside it must not reject the hook, or the host
+ * reports the user's own command or message as failed. The goal bookkeeping is
+ * not worth failing the command the user ran.
+ */
+function guardHook<TArgs extends unknown[], TResult>(
+  what: string,
+  callback: (...args: TArgs) => Promise<TResult>,
+): (...args: TArgs) => Promise<TResult> {
+  return async (...args: TArgs) => {
+    try {
+      return await callback(...args)
+    } catch (error) {
+      v2ErrorLog(`Failed to run ${what}`, error)
+      return undefined as TResult
+    }
   }
 }
 
 /**
- * Guard a tool hook callback.
- *
- * A tool hook runs on every tool call, and the hook reads and writes the goal
- * state. A state failure inside it must not reject the hook, or the host
- * reports the user's own tool call as failed - the goal bookkeeping is not
- * worth failing the command the user ran.
+ * Guard every hook the V1 API exposes, so a failure in one of them cannot
+ * reject the hook the host is waiting on.
  */
-function guardToolHook<TInput>(what: string, callback: (input: TInput) => Promise<void>) {
-  return async (input: TInput) => {
-    try {
-      await callback(input)
-    } catch (error) {
-      v2ErrorLog(`Failed to run ${what}`, error)
-    }
+function guardHooks<T extends Hooks>(hooks: T): T {
+  const guarded: Record<string, unknown> = {}
+  for (const [name, value] of Object.entries(hooks)) {
+    guarded[name] =
+      typeof value === "function"
+        ? async (...args: unknown[]) => {
+            try {
+              return await (value as (...a: unknown[]) => unknown)(...args)
+            } catch (error) {
+              v2ErrorLog(`Failed to run the ${name} hook`, error)
+              return undefined
+            }
+          }
+        : value
   }
+  return guarded as T
 }
 
 function v2ErrorLog(message: string, error: unknown) {
@@ -3444,7 +3474,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     // Keep the auto-turn reset behind an explicit user resume request. The
     // status tool remains model-callable, but it cannot renew the safety limit
     // unless this prompt-admission boundary grants one single-use reset.
-    await registerSafely("the prompt hook", () => context.session.hook("prompt", async (input) => {
+    await registerSafely("the prompt hook", () => context.session.hook("prompt", guardHook("the prompt hook", async (input) => {
         // Prompt hooks only fire in the session's owning location.
         if (typeof input.sessionID === "string") markSessionOwnership(input.sessionID, true)
         explicitResumeRequests.delete(input.sessionID)
@@ -3470,7 +3500,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         if (isExplicitResumePrompt(input.prompt.text, commandName, locale, messages)) {
           explicitResumeRequests.add(input.sessionID)
         }
-      }),
+      })),
     )
   }
 
@@ -3499,7 +3529,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     }),
   )
 
-  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", guardToolHook("the execute.before hook", async (input) => {
+  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", guardHook("the execute.before hook", async (input) => {
       taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id })
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
       // Tool execution only happens in the session's owning location.
@@ -3512,7 +3542,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     })),
   )
 
-  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", guardToolHook("the execute.after hook", async (input) => {
+  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", guardHook("the execute.after hook", async (input) => {
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
       const callID = typeof input.id === "string" ? input.id : undefined
       const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined
@@ -3571,13 +3601,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       name: "compaction",
       callback: (event: V2CompactionHookEvent) => Promise<void>,
     ) => Promise<{ dispose(): Promise<void> }>
-    await registerSafely("the compaction hook", () => hookCompaction("compaction", async (event) => {
+    await registerSafely("the compaction hook", () => hookCompaction("compaction", guardHook("the compaction hook", async (event) => {
         ensureSystemReminder(event.system)
         const goal = await getGoal(event.sessionID)
         if (!goal) return
         if (event.system.some((part) => part.type === "text" && part.text.startsWith(compactionContextPrefix(locale)))) return
         event.system.push({ type: "text", text: compactionContext(goal, locale) })
-      }),
+      })),
     )
   } catch {
     // Host predates the session compaction hook.
