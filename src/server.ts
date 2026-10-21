@@ -3571,7 +3571,18 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         const { done, value } = await iterator.next()
         if (done) break
         const event = decodeV2Event(value)
-        if (event) await handleV2Event(event)
+        if (!event) continue
+        // One event that fails must not take the consumer down with it. The
+        // handler writes the goal state, and a failed write - a transient
+        // Windows lock, a state file that cannot be decoded - would otherwise
+        // end the loop, and the plugin would never see another event: the
+        // goal would stop continuing and the sidebar would stop updating,
+        // with nothing beyond the first failure to show for it.
+        try {
+          await handleV2Event(event)
+        } catch (error) {
+          v2ErrorLog("Failed to handle a V2 event", error)
+        }
       }
     } catch (error) {
       if (!abortController.signal.aborted) v2ErrorLog("V2 event consumer stopped", error)

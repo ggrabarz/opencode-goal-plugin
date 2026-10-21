@@ -2952,3 +2952,39 @@ test("V2 a failing registration does not remove the plugin", async () => {
   mock.stream.end()
   await cleanup()
 })
+
+test("V2 a failing event does not stop the event consumer", async () => {
+  // The event handler writes the goal state. A failed write would otherwise
+  // end the consumer loop, and the plugin would never see another event: the
+  // goal would stop continuing and the sidebar would stop updating.
+  const mock = makeMockContext(
+    { auto_continue: false },
+    [],
+    {},
+    { directory: "/own" },
+    { ses_v2: { location: { directory: "/own" } } },
+  )
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "keep the consumer alive")
+
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH
+  if (!stateFile) throw new Error("expected a state path")
+  await writeFile(stateFile, "{ not json", "utf8")
+  await mock.stream.push({
+    type: "session.usage.updated",
+    created: 1,
+    data: { sessionID: "ses_v2", tokens: { input: 1, output: 1 } },
+  })
+
+  // A later event must still be processed.
+  await writeFile(stateFile, JSON.stringify({ version: 3, goals: {}, archives: {} }), "utf8")
+  await mock.stream.push({
+    type: "session.usage.updated",
+    created: 2,
+    data: { sessionID: "ses_after", tokens: { input: 1, output: 1 } },
+  })
+  await waitFor(() => mock.sessionGetCalls.includes("ses_after"))
+
+  mock.stream.end()
+  await cleanup()
+})
