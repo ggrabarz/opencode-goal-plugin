@@ -444,12 +444,39 @@ function rotateIfNeeded(path) {
     renameSync(path, previous);
   } catch {}
 }
+function describeError(error, depth = 0) {
+  if (error == null)
+    return String(error);
+  if (typeof error === "string")
+    return error;
+  if (typeof error !== "object")
+    return String(error);
+  if (depth > 6)
+    return "...";
+  const record = error;
+  const tag = typeof record._tag === "string" ? record._tag : typeof record.name === "string" ? record.name : typeof record.constructor === "string" ? record.constructor : "Error";
+  const message = typeof record.message === "string" ? record.message : "";
+  const head = message && message !== tag ? `${tag}: ${message}` : tag;
+  const cause = record.cause;
+  if (cause == null)
+    return head;
+  if (typeof cause === "string")
+    return `${head} <- ${cause}`;
+  if (typeof cause === "object") {
+    const pretty = cause.pretty;
+    if (typeof pretty === "string" && pretty.trim()) {
+      return `${head} <- ${pretty.split(`
+`).map((line) => line.trim()).filter(Boolean).join(" | ")}`;
+    }
+  }
+  return `${head} <- ${describeError(cause, depth + 1)}`;
+}
 function reportPluginError(message, error) {
   try {
     const path = diagnosticsLogPath();
     mkdirSync(dirname2(path), { recursive: true });
     rotateIfNeeded(path);
-    const detail = error === undefined ? "" : ` | ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`;
+    const detail = error === undefined ? "" : ` | ${describeError(error)}`;
     appendFileSync(path, `${new Date().toISOString()} | error | ${message}${detail}
 `);
   } catch {}
