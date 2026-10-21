@@ -36,6 +36,7 @@ import {
   updateGoalObjective,
   updateGoalPlan,
   validateEvidence,
+  waitForPendingMutations,
   validateObjective,
 } from "./state"
 import type { GoalLocale, GoalMessages } from "./i18n"
@@ -3624,6 +3625,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     // unload on a stream that does not close promptly.
     const termination = Promise.allSettled([consumer, eventIterator?.return?.()])
     await Promise.race([termination, new Promise((resolve) => setTimeout(resolve, 2_000))])
+    // Let the state writes that are already in flight finish. A host that
+    // reloads the plugin tears the state directory down with it, and a write
+    // that is still running would fail and lose the change it carried.
+    await waitForPendingMutations()
   }
 }
 

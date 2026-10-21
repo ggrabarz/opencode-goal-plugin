@@ -855,6 +855,14 @@ function enqueueMutation(operation) {
   });
   return current;
 }
+async function waitForPendingMutations() {
+  for (;; ) {
+    const pending = mutationQueue;
+    await pending.catch(() => {});
+    if (pending === mutationQueue)
+      return;
+  }
+}
 async function mutate(fn) {
   return enqueueMutation(async () => {
     const file = statePath();
@@ -5534,6 +5542,7 @@ async function setupV2(context) {
       await registration.dispose();
     const termination = Promise.allSettled([consumer, eventIterator?.return?.()]);
     await Promise.race([termination, new Promise((resolve) => setTimeout(resolve, 2000))]);
+    await waitForPendingMutations();
   };
 }
 function goalToolsV2(services) {

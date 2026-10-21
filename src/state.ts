@@ -570,6 +570,24 @@ function enqueueMutation<T>(operation: () => Promise<T>) {
   return current
 }
 
+/**
+ * Wait until the queued state mutations have finished.
+ *
+ * A host that reloads the plugin - which happens whenever the plugin files
+ * change - tears the plugin down while a state write can still be in flight.
+ * The write then fails, because the directory it is writing into is gone, and
+ * the change it carried is lost. The atomic write keeps the previous state
+ * file intact, so nothing is corrupted, but the write is still abandoned and
+ * reported as a failure.
+ */
+export async function waitForPendingMutations() {
+  for (;;) {
+    const pending = mutationQueue
+    await pending.catch(() => {})
+    if (pending === mutationQueue) return
+  }
+}
+
 async function mutate<T>(fn: (state: State) => T | Promise<T>) {
   return enqueueMutation(async () => {
     const file = statePath()
