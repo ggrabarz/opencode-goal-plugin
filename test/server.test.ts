@@ -4400,3 +4400,21 @@ test("V1 a failing event does not reject the hook", async () => {
   await waitFor(() => calls.length >= 1, 3000)
   expect(calls.length).toBeGreaterThanOrEqual(1)
 })
+
+test("V1 a failing tool hook does not fail the tool call", async () => {
+  // A tool hook runs on every tool call and reads the goal state. A state
+  // failure inside it must not reject the hook, or the host reports the user's
+  // own command as failed.
+  const client = { session: { promptAsync: async () => {} } }
+  const hooks = await setupServer({ client } as never, { auto_continue: false })
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const before = hooks["tool.execute.before"]
+  const after = hooks["tool.execute.after"]
+  expect(before).toBeDefined()
+  expect(after).toBeDefined()
+  const output = { title: "bash", output: "done", metadata: {} }
+  await before!({ tool: "bash", sessionID: "ses_1", callID: "call_1", args: {} } as never, output as never)
+  await after!({ tool: "bash", sessionID: "ses_1", callID: "call_1", args: {} } as never, output as never)
+})
