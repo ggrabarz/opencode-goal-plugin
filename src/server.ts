@@ -2024,6 +2024,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
       toolAttempts.clear()
       explicitResumeRequests.clear()
     objectiveEdits.clear()
+      // Let the state writes that are already in flight finish. A host that
+      // reloads the plugin tears the state directory down with it, and a write
+      // that is still running would fail and lose the change it carried.
+      await waitForPendingMutations()
     },
     async config(config) {
       if (!registerCommand) return
