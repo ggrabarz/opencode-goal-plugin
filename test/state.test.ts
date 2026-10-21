@@ -1163,3 +1163,49 @@ test("a late continuation failure does not clear a newer pending attempt", async
   expect((await getGoal("ses_1"))?.continuationFailures).toBe(0)
   expect((await getGoal("ses_1"))?.status).toBe("active")
 })
+
+test("the minimum continuation interval is measured from the millisecond anchor", async () => {
+  // The interval gate compares whole-second timestamps, so a follow-up
+  // continuation can slip through as soon as the wall clock crosses into the
+  // next second, even when the real elapsed time is far below the configured
+  // minimum. A fast execution must wait for the whole interval.
+  const base = 1_700_000_000_000
+  await createGoal("ses_1", "continue", null)
+
+  // Reserve 900ms into a whole second.
+  setSystemTime(new Date(base + 900))
+  const first = await reserveContinuation("ses_1", 10, 1)
+  expect(first).not.toBeNull()
+  expect(first?.lastContinuationAt).toBe(Math.floor((base + 900) / 1000))
+
+  // 200ms later the wall clock is in the next second, but only 200ms of the
+  // one second minimum has elapsed.
+  setSystemTime(new Date(base + 1_100))
+  const second = await reserveContinuation("ses_1", 10, 1)
+  expect(second).toBeNull()
+
+  // Once the full minimum has elapsed the continuation is allowed again.
+  setSystemTime(new Date(base + 1_950))
+  const third = await reserveContinuation("ses_1", 10, 1)
+  expect(third).not.toBeNull()
+})
+
+test("rolling back a continuation restores the minimum interval anchor", async () => {
+  // A rolled-back attempt must not leave the goal waiting out an interval it
+  // never really used: the anchor is restored with the attempt, so a follow-up
+  // continuation is allowed again.
+  const base = 1_700_000_000_000
+  await createGoal("ses_1", "continue", null)
+
+  setSystemTime(new Date(base + 900))
+  const reserved = await reserveContinuation("ses_1", 10, 1)
+  expect(reserved).not.toBeNull()
+
+  const rolled = await rollbackContinuationAttempt("ses_1", { attemptID: reserved?.pendingAttempt?.id })
+  expect(rolled).toBe(true)
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt).toBeNull()
+  expect((await getGoal("ses_1"))?.autoTurns).toBe(0)
+
+  setSystemTime(new Date(base + 1_100))
+  expect(await reserveContinuation("ses_1", 10, 1)).not.toBeNull()
+})

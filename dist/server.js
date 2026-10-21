@@ -458,7 +458,8 @@ var PendingAttemptSchema = Schema.Struct({
   delivered: Schema.Boolean,
   committed: Schema.Boolean,
   armNoProgress: Schema.Boolean,
-  previousLastContinuationAt: Schema.NullOr(Schema.Number)
+  previousLastContinuationAt: Schema.NullOr(Schema.Number),
+  previousLastContinuationAtMs: Schema.optionalWith(NullableNumber, { default: () => null })
 });
 var UsageTrackerSchema = Schema.Struct({
   baseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
@@ -487,6 +488,7 @@ var GoalSchema = Schema.Struct({
   lastAccountedAt: NullableNumber,
   autoTurns: Schema.Number,
   lastContinuationAt: NullableNumber,
+  lastContinuationAtMs: Schema.optionalWith(NullableNumber, { default: () => null }),
   continuationFailures: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   pendingAttempt: Schema.optionalWith(Schema.NullOr(PendingAttemptSchema), { default: () => null }),
   lastStatus: Schema.optionalWith(NullableString, { default: () => null }),
@@ -748,6 +750,7 @@ function normalizeGoal(goal) {
   goal.lastPromptAgent ??= null;
   goal.awaitingContinuationProgress = goal.awaitingContinuationProgress === true;
   goal.lastContinuationAt = typeof goal.lastContinuationAt === "number" && Number.isFinite(goal.lastContinuationAt) ? Math.floor(goal.lastContinuationAt >= 1000000000000 ? goal.lastContinuationAt / 1000 : goal.lastContinuationAt) : null;
+  goal.lastContinuationAtMs = typeof goal.lastContinuationAtMs === "number" && Number.isFinite(goal.lastContinuationAtMs) ? Math.floor(goal.lastContinuationAtMs) : null;
   goal.pendingAttempt = normalizePendingAttempt(goal.pendingAttempt);
   goal.continuationBaselineMessageID ??= "";
   goal.continuationBaselineSummary ??= "";
@@ -793,7 +796,8 @@ function normalizePendingAttempt(attempt) {
     delivered: attempt.delivered === true,
     committed: attempt.committed === true,
     armNoProgress: attempt.armNoProgress !== false,
-    previousLastContinuationAt: typeof attempt.previousLastContinuationAt === "number" && Number.isFinite(attempt.previousLastContinuationAt) ? attempt.previousLastContinuationAt : null
+    previousLastContinuationAt: typeof attempt.previousLastContinuationAt === "number" && Number.isFinite(attempt.previousLastContinuationAt) ? attempt.previousLastContinuationAt : null,
+    previousLastContinuationAtMs: typeof attempt.previousLastContinuationAtMs === "number" && Number.isFinite(attempt.previousLastContinuationAtMs) ? attempt.previousLastContinuationAtMs : null
   };
 }
 function randomId() {
@@ -952,6 +956,7 @@ function createGoalRecord(sessionID, objective, normalizedOptions, now = nowSeco
     lastAccountedAt: paused ? null : now,
     autoTurns: 0,
     lastContinuationAt: null,
+    lastContinuationAtMs: null,
     continuationFailures: 0,
     pendingAttempt: null,
     lastStatus: paused ? "Goal recorded from Plan mode; execution paused until resumed from Build mode." : "Goal set.",
@@ -1393,11 +1398,14 @@ async function reserveContinuation(sessionID, maxAutoTurns, minIntervalSeconds) 
     accountWallClock(goal, now);
     if (maybeStopForUsageLimit(goal, maxAutoTurns, now))
       return reserveWrapup(goal);
-    if (goal.lastContinuationAt && now - goal.lastContinuationAt < minIntervalSeconds)
+    const anchor = goal.lastContinuationAtMs ?? (goal.lastContinuationAt != null ? goal.lastContinuationAt * 1000 : null);
+    if (anchor != null && Date.now() - anchor < minIntervalSeconds * 1000)
       return null;
     goal.autoTurns += 1;
     const previousLastContinuationAt = goal.lastContinuationAt;
+    const previousLastContinuationAtMs = goal.lastContinuationAtMs;
     goal.lastContinuationAt = now;
+    goal.lastContinuationAtMs = Date.now();
     goal.continuationBaselineMessageID = goal.lastAssistantMessageID;
     goal.continuationBaselineSummary = summarizeText(goal.lastAssistantText);
     goal.pendingAttempt = {
@@ -1407,7 +1415,8 @@ async function reserveContinuation(sessionID, maxAutoTurns, minIntervalSeconds) 
       delivered: false,
       committed: true,
       armNoProgress: true,
-      previousLastContinuationAt
+      previousLastContinuationAt,
+      previousLastContinuationAtMs
     };
     goal.awaitingContinuationProgress = false;
     goal.lastStatus = `Auto-continue ${goal.autoTurns} reserved.`;
@@ -1433,6 +1442,7 @@ async function rollbackContinuationAttempt(sessionID, expected) {
     }
     goal.autoTurns = Math.max(0, goal.autoTurns - 1);
     goal.lastContinuationAt = attempt.previousLastContinuationAt;
+    goal.lastContinuationAtMs = attempt.previousLastContinuationAtMs;
     goal.pendingAttempt = null;
     goal.awaitingContinuationProgress = false;
     goal.lastStatus = "Auto-continue attempt canceled before delivery.";
@@ -1468,9 +1478,10 @@ async function recordContinuationResult(sessionID, result, maxFailures, options)
             delivered: true,
             committed: false,
             armNoProgress: options?.armNoProgress !== false,
-            previousLastContinuationAt: goal.lastContinuationAt
+            previousLastContinuationAt: goal.lastContinuationAt,
+            previousLastContinuationAtMs: goal.lastContinuationAtMs
           };
-          if (goal.pendingAttempt.armNoProgress)
+          if (goal.pendingAttempt?.armNoProgress)
             goal.awaitingContinuationProgress = true;
         }
         goal.lastStatus = "Auto-continue prompt sent.";
@@ -4616,7 +4627,7 @@ async function setupV2(context) {
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
       if (!goal) {
         const waiting = await getGoalInternal(sessionID);
-        if (waiting?.status === "active" && waiting.pendingAttempt == null && waiting.lastContinuationAt != null && minInterval > 0) {
+        if (waiting?.status === "active" && waiting.lastContinuationAt != null && minInterval > 0) {
           scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, waiting.lastContinuationAt), scheduled != null);
         }
         return;
