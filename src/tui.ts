@@ -19,10 +19,12 @@ type GoalHistoryEntry = {
   timestamp: number
 }
 
+export type GoalStatus = "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet" | "cancelled"
+
 type GoalSnapshot = {
   sessionID: string
   objective: string
-  status: "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet" | "cancelled"
+  status: GoalStatus
   tokenBudget: number | null
   tokensUsed: number
   timeUsedSeconds: number
@@ -101,6 +103,28 @@ const GOAL_TOOL_NAMES: readonly string[] = [
   "replace_goal",
   "clear_goal",
 ]
+
+/**
+ * The glyph that stands for each goal status.
+ *
+ * Every status gets its own plain text glyph. None of them is an emoji: each
+ * one is a text presentation character on its own, so the icon reads the same
+ * in a terminal, in the host's TUI and in a font that has no emoji at all.
+ */
+export const GOAL_STATUS_GLYPHS: Readonly<Record<GoalStatus, string>> = {
+  active: "▶", // U+25B6 BLACK RIGHT-POINTING TRIANGLE
+  paused: "‖", // U+2016 DOUBLE VERTICAL LINE
+  budgetLimited: "⚠", // U+26A0 WARNING SIGN
+  usageLimited: "⌛", // U+231B HOURGLASS
+  complete: "✓", // U+2713 CHECK MARK
+  unmet: "✗", // U+2717 BALLOT X
+  cancelled: "⊗", // U+2297 CIRCLED TIMES
+}
+
+/** The glyph for a goal status. An unknown status reads as running. */
+export function goalStatusGlyph(status: GoalStatus): string {
+  return GOAL_STATUS_GLYPHS[status] ?? GOAL_STATUS_GLYPHS.active
+}
 
 function element(tag: string, props: Record<string, unknown>, children: ElementChild[] = []) {
   const node = createElement(tag)
@@ -534,6 +558,69 @@ export function formatGoal(goal: GoalSnapshot | null, messages: GoalMessages, lo
   return lines.join("\n")
 }
 
+export type GoalStateLineKind = "title" | "detail" | "objective" | "badge"
+
+export type GoalStateLine = {
+  readonly kind: GoalStateLineKind
+  readonly text: string
+}
+
+/**
+ * The canonical view of the goal state.
+ *
+ * The sidebar renders these lines and the popup shows exactly these lines, so
+ * the two surfaces cannot show different values for the same goal: there is
+ * one function that reads the goal and one list of lines that leaves it.
+ */
+export function goalStateLines(
+  goal: GoalSnapshot,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+  nowSeconds = currentEpochSeconds(),
+): GoalStateLine[] {
+  if (goal.status === "complete" || goal.status === "unmet") {
+    const elapsed = liveTimeUsedSeconds(goal, nowSeconds)
+    return [
+      {
+        kind: "badge",
+        text: `${goal.status === "complete" ? messages.tui.achieved : messages.tui.unmet} (${formatDurationBadge(elapsed)})`,
+      },
+    ]
+  }
+  const detail = (text: string): GoalStateLine => ({ kind: "detail", text })
+  return [
+    { kind: "title", text: messages.tui.title },
+    detail(`${messages.tui.status}: ${presentGoalStatus(goal.status, locale)}`),
+    detail(`${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(goal, nowSeconds))}`),
+    detail(`${messages.tui.tokens}: ${goal.tokensUsed}${goal.tokenBudget == null ? "" : `/${goal.tokenBudget}`}`),
+    detail(`${messages.tui.autoContinues}: ${goal.autoTurns}${goal.maxAutoTurns == null ? "" : `/${goal.maxAutoTurns}`}`),
+    ...(goal.lastCheckpoint ? [detail(`${messages.tui.checkpoint}: ${goal.lastCheckpoint.summary}`)] : []),
+    ...(goal.stopReason ? [detail(`${messages.tui.stop}: ${presentGoalStopReason(goal.stopReason, locale)}`)] : []),
+    ...(goal.lastStatus ? [detail(presentGoalLastStatus(goal.lastStatus, locale))] : []),
+    { kind: "objective", text: goal.objective },
+  ]
+}
+
+type GoalStateColors = {
+  readonly text: unknown
+  readonly muted: unknown
+  readonly achieved: unknown
+}
+
+/**
+ * Renders the shared goal state lines as text elements.
+ *
+ * The sidebar and the popup read the same lines, so only the colours differ
+ * between the two surfaces.
+ */
+function goalStateElements(lines: GoalStateLine[], status: GoalStatus, colors: GoalStateColors) {
+  return lines.map((line) => {
+    if (line.kind === "badge") return text({ fg: status === "complete" ? colors.achieved : colors.muted }, [line.text])
+    if (line.kind === "title") return text({ fg: colors.text }, [line.text])
+    return text({ fg: colors.muted }, [line.text])
+  })
+}
+
 function GoalSidebar(api: TuiPluginApi, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>, sessionID: string) {
   const theme = api.theme.current
   const state = goalStateFromSession(api, sessionID)
@@ -555,31 +642,11 @@ function GoalSidebar(api: TuiPluginApi, messages: GoalMessages, locale: ReturnTy
   return box({}, [() => {
     const snapshot = goal()
     if (!snapshot) return null
-    if (snapshot.status === "complete" || snapshot.status === "unmet") {
-      const elapsed = liveTimeUsedSeconds(snapshot)
-      return text({ fg: snapshot.status === "complete" ? theme.primary : theme.textMuted }, [
-        `${snapshot.status === "complete" ? messages.tui.achieved : messages.tui.unmet} (${formatDurationBadge(elapsed)})`,
-      ])
-    }
-    return box({}, [
-      text({ fg: theme.text }, [messages.tui.title]),
-      text({ fg: theme.textMuted }, [`${messages.tui.status}: ${presentGoalStatus(snapshot.status, locale)}`]),
-      text({ fg: theme.textMuted }, [`${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(snapshot, nowSeconds()))}`]),
-      text({ fg: theme.textMuted }, [
-        `${messages.tui.tokens}: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`,
-      ]),
-      text({ fg: theme.textMuted }, [
-        `${messages.tui.autoContinues}: ${snapshot.autoTurns}${snapshot.maxAutoTurns == null ? "" : `/${snapshot.maxAutoTurns}`}`,
-      ]),
-      ...(snapshot.lastCheckpoint
-        ? [text({ fg: theme.textMuted }, [`${messages.tui.checkpoint}: ${snapshot.lastCheckpoint.summary}`])]
-        : []),
-      ...(snapshot.stopReason
-        ? [text({ fg: theme.textMuted }, [`${messages.tui.stop}: ${presentGoalStopReason(snapshot.stopReason, locale)}`])]
-        : []),
-      ...(snapshot.lastStatus ? [text({ fg: theme.textMuted }, [presentGoalLastStatus(snapshot.lastStatus, locale)])] : []),
-      text({ fg: theme.textMuted }, [snapshot.objective]),
-    ])
+    return box({}, goalStateElements(goalStateLines(snapshot, messages, locale, nowSeconds()), snapshot.status, {
+      text: theme.text,
+      muted: theme.textMuted,
+      achieved: theme.primary,
+    }))
   }])
 }
 
@@ -767,40 +834,11 @@ function GoalSidebarV2(
   return box({}, [() => {
     const snapshot = goal()
     if (!snapshot) return null
-    if (snapshot.status === "complete" || snapshot.status === "unmet") {
-      const elapsed = liveTimeUsedSeconds(snapshot)
-      return text({ fg: snapshot.status === "complete" ? colors.achieved : colors.muted }, [
-        `${snapshot.status === "complete" ? messages.tui.achieved : messages.tui.unmet} (${formatDurationBadge(elapsed)})`,
-      ])
-    }
-    return box({}, [
-      text({ fg: colors.text }, [messages.tui.title]),
-      text({ fg: colors.muted }, [`${messages.tui.status}: ${presentGoalStatus(snapshot.status, locale)}`]),
-      text({ fg: colors.muted }, [`${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(snapshot, nowSeconds()))}`]),
-      text({ fg: colors.muted }, [
-        `${messages.tui.tokens}: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`,
-      ]),
-      text({ fg: colors.muted }, [
-        `${messages.tui.autoContinues}: ${snapshot.autoTurns}${
-          snapshot.maxAutoTurns == null ? "" : `/${snapshot.maxAutoTurns}`
-        }`,
-      ]),
-      ...(snapshot.lastCheckpoint
-        ? [text({ fg: colors.muted }, [`${messages.tui.checkpoint}: ${snapshot.lastCheckpoint.summary}`])]
-        : []),
-      ...(snapshot.stopReason
-        ? [
-            text(
-              { fg: colors.muted },
-              [`${messages.tui.stop}: ${presentGoalStopReason(snapshot.stopReason, locale)}`],
-            ),
-          ]
-        : []),
-      ...(snapshot.lastStatus
-        ? [text({ fg: colors.muted }, [presentGoalLastStatus(snapshot.lastStatus, locale)])]
-        : []),
-      text({ fg: colors.muted }, [snapshot.objective]),
-    ])
+    return box({}, goalStateElements(goalStateLines(snapshot, messages, locale, nowSeconds()), snapshot.status, {
+      text: colors.text,
+      muted: colors.muted,
+      achieved: colors.achieved,
+    }))
   }])
 }
 

@@ -11,6 +11,9 @@ import { createStore, type Store } from "solid-js/store"
 import type { SessionMessageAssistantTool, SessionMessageInfo } from "@opencode/client"
 import plugin, {
   goalFromV2Messages,
+  goalStateLines,
+  goalStatusGlyph,
+  GOAL_STATUS_GLYPHS,
   liveTimeUsedSeconds,
   readPersistedGoal,
   registerSlotV2,
@@ -18,6 +21,7 @@ import plugin, {
   themeColorV2,
 } from "../src/tui.ts"
 import { atomicWriteFile } from "../src/atomic-write"
+import { messagesFor, resolveLocale } from "../src/i18n"
 
 type GoalSnapshot = Parameters<typeof liveTimeUsedSeconds>[0]
 
@@ -336,6 +340,92 @@ test("V2 TUI definition exposes id and a setup function", () => {
   expect(plugin.id).toBe("local.goal-mode.tui")
   expect(typeof plugin.setup).toBe("function")
   expect(typeof plugin.tui).toBe("function")
+})
+
+test("every goal status maps to its own plain text glyph", () => {
+  const statuses = [
+    "active",
+    "paused",
+    "budgetLimited",
+    "usageLimited",
+    "complete",
+    "unmet",
+    "cancelled",
+  ] as const
+
+  expect(Object.keys(GOAL_STATUS_GLYPHS).sort()).toEqual([...statuses].sort())
+
+  const glyphs = statuses.map((status) => goalStatusGlyph(status))
+  // One status, one glyph: no two statuses may share an icon.
+  expect(new Set(glyphs).size).toBe(statuses.length)
+  for (const glyph of glyphs) {
+    expect([...glyph]).toHaveLength(1)
+    // Below the emoji planes: every glyph is a plain text character, so no
+    // font without emoji support renders a placeholder box.
+    expect(glyph.codePointAt(0)!).toBeLessThan(0x1f000)
+  }
+
+  expect(GOAL_STATUS_GLYPHS.active.codePointAt(0)).toBe(0x25b6)
+  expect(GOAL_STATUS_GLYPHS.paused.codePointAt(0)).toBe(0x2016)
+  expect(GOAL_STATUS_GLYPHS.budgetLimited.codePointAt(0)).toBe(0x26a0)
+  expect(GOAL_STATUS_GLYPHS.usageLimited.codePointAt(0)).toBe(0x231b)
+  expect(GOAL_STATUS_GLYPHS.complete.codePointAt(0)).toBe(0x2713)
+  expect(GOAL_STATUS_GLYPHS.unmet.codePointAt(0)).toBe(0x2717)
+  expect(GOAL_STATUS_GLYPHS.cancelled.codePointAt(0)).toBe(0x2297)
+})
+
+test("the shared goal state lines carry the state the sidebar shows", () => {
+  const messages = messagesFor(resolveLocale("en"))
+  const locale = resolveLocale("en")
+
+  const lines = goalStateLines(
+    goal({
+      objective: "ship the milestone",
+      status: "paused",
+      tokensUsed: 42,
+      autoTurns: 3,
+      maxAutoTurns: 9,
+      lastStatus: "Goal paused.",
+      lastCheckpoint: { summary: "parser verified", timestamp: 101 },
+    }),
+    messages,
+    locale,
+    100,
+  )
+
+  expect(lines.map((line) => line.text)).toEqual([
+    "Goal",
+    "Status: paused",
+    "Time: 0:10",
+    "Tokens: 42",
+    "Auto-continues: 3/9",
+    "Checkpoint: parser verified",
+    "Goal paused.",
+    "ship the milestone",
+  ])
+})
+
+test("the shared goal state lines collapse a closed goal into its badge", () => {
+  const messages = messagesFor(resolveLocale("en"))
+  const locale = resolveLocale("en")
+
+  const complete = goalStateLines(
+    goal({ status: "complete", timeUsedSeconds: 65, sampledAt: 100 }),
+    messages,
+    locale,
+    100,
+  )
+  expect(complete).toHaveLength(1)
+  expect(complete[0]?.kind).toBe("badge")
+  expect(complete[0]?.text).toBe("Goal achieved (1:05)")
+
+  const unmet = goalStateLines(
+    goal({ status: "unmet", timeUsedSeconds: 5, sampledAt: 100, blocker: "no access" }),
+    messages,
+    locale,
+    100,
+  )
+  expect(unmet[0]?.text).toBe("Goal unmet (0:05)")
 })
 
 test("registerSlotV2 uses the options argument when the host takes one parameter", () => {
