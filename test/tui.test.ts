@@ -246,7 +246,6 @@ test("V1 the goal state popup opens a dialog with the state the sidebar shows", 
   const snapshot = goal({ objective: "popup goal", status: "paused" })
   const registered: { value: string; keybind?: string; onSelect?: () => void }[] = []
   let replaced: (() => unknown) | undefined
-  let alertProps: { title: string; message: string } | undefined
   const api = {
     slots: { register() { return "slot-id" } },
     command: {
@@ -265,12 +264,17 @@ test("V1 the goal state popup opens a dialog with the state the sidebar shows", 
         },
         clear() {},
       },
-      DialogAlert(props: { title: string; message: string }) {
-        alertProps = props
-        return null
+    },
+    theme: {
+      current: {
+        text: "#ffffff",
+        textMuted: "#888888",
+        primary: "#00ff00",
+        warning: "#ffcc00",
+        success: "#00ff00",
+        error: "#ff0000",
       },
     },
-    theme: { current: { text: "#ffffff", textMuted: "#888888" } },
     state: {
       session: { messages: () => [{ id: "created" }] },
       part: () => [
@@ -288,10 +292,19 @@ test("V1 the goal state popup opens a dialog with the state the sidebar shows", 
   await new Promise((resolve) => setTimeout(resolve, 20))
 
   expect(replaced).toBeTypeOf("function")
-  replaced?.()
-  expect(alertProps?.message).toContain("popup goal")
-  expect(alertProps?.message).toContain("Status: paused")
-  expect(alertProps?.title).toContain(goalStatusGlyph("paused"))
+  const setup = await testRender(() => replaced?.() as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("popup goal")
+    expect(frame).toContain("Status: paused")
+    expect(frame).toContain(goalStatusGlyph("paused"))
+    setup.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) setup.renderer.destroy()
+  }
 })
 
 test("V1 the goal status icon sits next to the prompt", async () => {

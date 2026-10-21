@@ -682,6 +682,72 @@ type GoalStateColors = {
 }
 
 /**
+ * The colours of the goal state popup.
+ *
+ * The popup is the only place the goal state is shown when the window is too
+ * small for the sidebar, so it has to read at a glance: the status carries
+ * its own colour, the labels are quiet and the values are plain.
+ */
+type GoalDialogColors = {
+  readonly text: unknown
+  readonly muted: unknown
+  readonly status: unknown
+}
+
+/**
+ * One line of the goal state, with the label and the value in their own
+ * colours.
+ */
+function goalStateLineElement(line: GoalStateLine, colors: GoalDialogColors, messages: GoalMessages) {
+  if (line.kind === "badge" || line.kind === "title") return text({ fg: colors.status }, [line.text])
+  if (line.kind === "objective") return text({ fg: colors.text }, [line.text])
+  const split = line.text.indexOf(": ")
+  if (split < 0) return text({ fg: colors.muted }, [line.text])
+  const label = line.text.slice(0, split + 2)
+  const value = line.text.slice(split + 2)
+  // The status is the one line that carries the colour of the status.
+  const valueColor = label.startsWith(messages.tui.status) ? colors.status : colors.text
+  return text({}, [
+    element("span", { style: { fg: colors.muted } }, [label]),
+    element("span", { style: { fg: valueColor } }, [value]),
+  ])
+}
+
+/**
+ * The content of the goal state popup.
+ *
+ * The state is the same state the sidebar shows - the same lines from the
+ * same function - but it scrolls, so a long objective or a small terminal
+ * still shows every line, and it is coloured, so the status reads at a
+ * glance.
+ */
+function goalStateDialogContent(
+  goal: GoalSnapshot | null,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+  colors: GoalDialogColors,
+  maxHeight: number,
+) {
+  if (!goal) return box({}, [text({ fg: colors.muted }, [messages.tui.noGoal])])
+  const lines = goalStateLines(goal, messages, locale).filter((line) => line.kind !== "title")
+  return box({ flexDirection: "column" }, [
+    text({ fg: colors.status }, [`${goalStatusGlyph(goal.status)} ${messages.tui.title}`]),
+    element(
+      "scrollbox",
+      { scrollY: true, maxHeight, flexShrink: 1 },
+      [box({ flexDirection: "column" }, lines.map((line) => goalStateLineElement(line, colors, messages)))],
+    ),
+    text({ fg: colors.muted }, [messages.tui.closeHint]),
+  ])
+}
+
+/** The height of the scrolling area of the popup, in rows. */
+function goalDialogMaxHeight(renderer: { height?: number } | undefined) {
+  const rows = typeof renderer?.height === "number" ? renderer.height : 24
+  return Math.max(6, Math.min(24, rows - 10))
+}
+
+/**
  * Resolves the goal the surfaces show.
  *
  * The persisted state file and the session messages are two views of the same
@@ -763,15 +829,22 @@ async function showGoalStatePopupV1(
     await readPersistedGoal(sessionID),
     goalFromSession(api, sessionID) ?? undefined,
   )
-  const title = goal ? `${goalStatusGlyph(goal.status)} ${messages.tui.title}` : messages.tui.title
-  const message = goal
-    ? goalStateLines(goal, messages, locale)
-        .map((line) => line.text)
-        .join("\n")
-    : messages.tui.noGoal
+  const theme = api.theme.current
   try {
     api.ui.dialog.setSize("large")
-    api.ui.dialog.replace(() => api.ui.DialogAlert({ title, message }))
+    api.ui.dialog.replace(() =>
+      goalStateDialogContent(
+        goal,
+        messages,
+        locale,
+        {
+          text: theme.text,
+          muted: theme.textMuted,
+          status: goal ? goalStatusColorV1(goal.status, theme) : theme.textMuted,
+        },
+        goalDialogMaxHeight(api.renderer),
+      ),
+    )
   } catch (error) {
     toast(api, messages, error instanceof Error ? error.message : String(error), "error")
   }
@@ -1058,22 +1131,28 @@ async function showGoalStatePopupV2(
     await readPersistedGoal(sessionID),
     goalFromV2Messages(api.data.session.message.list(sessionID)),
   )
-  const title = goal ? `${goalStatusGlyph(goal.status)} ${messages.tui.title}` : messages.tui.title
-  const message = goal
-    ? goalStateLines(goal, messages, locale)
-        .map((line) => line.text)
-        .join("\n")
-    : messages.tui.noGoal
+  const colors = goalColorsV2(api.theme)
   try {
-    const closed = api.ui.dialog.alert({ title, message })
-    // The dialog host resets its presentation while it pushes the alert onto
-    // the stack, so the size is applied after the alert was pushed.
+    api.ui.dialog.show(() =>
+      goalStateDialogContent(
+        goal,
+        messages,
+        locale,
+        {
+          text: colors.text,
+          muted: colors.muted,
+          status: goal ? goalStatusColorV2(goal.status, api.theme) : colors.muted,
+        },
+        goalDialogMaxHeight(api.renderer),
+      ),
+    )
+    // The dialog host resets the presentation while it pushes the content onto
+    // the stack, so the size is applied after the content was pushed.
     try {
       api.ui.dialog.set({ size: "large", centered: true })
     } catch {
       // The presentation options are best effort.
     }
-    await closed
   } catch (error) {
     // The command runs detached, so a rejection here would be an unhandled
     // rejection in the host's TUI process.
