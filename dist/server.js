@@ -4200,7 +4200,9 @@ var server = async ({ client }, options) => {
             const attempt = pendingAttemptOf(goal);
             if (attempt != null) {
               const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
-                requirePending: true
+                requirePending: true,
+                expectedGoalID: goal.id,
+                expectedAttemptID: attempt.id
               });
               if (afterFailure)
                 locallyDeliveredPendingSessions.delete(sessionID);
@@ -4841,7 +4843,9 @@ async function setupV2(context) {
             const attempt = pendingAttemptOf(goal);
             if (attempt != null) {
               const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
-                requirePending: true
+                requirePending: true,
+                expectedGoalID: goal.id,
+                expectedAttemptID: attempt.id
               });
               if (afterFailure)
                 locallyDeliveredPendingSessions.delete(sessionID);

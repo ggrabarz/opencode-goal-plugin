@@ -1120,3 +1120,46 @@ test("delayed prior-turn assistant output cannot clear a newer pending attempt",
   })
   expect((await getGoalInternal("ses_1"))?.pendingAttempt).toBeNull()
 })
+
+test("a late continuation result does not clear a newer pending attempt", async () => {
+  // A fast execution can reserve a new attempt while the previous
+  // continuation's prompt is still in flight. The late result belongs to the
+  // previous attempt, so it must not clear the newer pending attempt: doing
+  // so strands the goal with no pending continuation and no queued wake-up.
+  await createGoal("ses_1", "continue", null)
+  const reserved = await reserveContinuation("ses_1", 10, 0)
+  const attemptID = reserved?.pendingAttempt?.id
+  expect(attemptID).toBeString()
+
+  // A result for an attempt that is no longer pending is ignored.
+  const stale = await recordContinuationResult("ses_1", "success", 3, {
+    expectedAttemptID: "an-attempt-that-is-no-longer-pending",
+  })
+  expect(stale).toBeNull()
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt?.id).toBe(attemptID)
+
+  // The matching result still commits the attempt it belongs to.
+  const delivered = await recordContinuationResult("ses_1", "success", 3, {
+    expectedAttemptID: attemptID,
+  })
+  expect(delivered?.pendingAttempt?.delivered).toBe(true)
+})
+
+test("a late continuation failure does not clear a newer pending attempt", async () => {
+  // A transport failure reported for a previous attempt must not clear the
+  // attempt that is pending now, and must not count a phantom failure toward
+  // the ceiling that pauses the goal.
+  await createGoal("ses_1", "continue", null)
+  const reserved = await reserveContinuation("ses_1", 10, 0)
+  const attemptID = reserved?.pendingAttempt?.id
+  expect(attemptID).toBeString()
+
+  const stale = await recordContinuationResult("ses_1", "failure", 3, {
+    requirePending: true,
+    expectedAttemptID: "an-attempt-that-is-no-longer-pending",
+  })
+  expect(stale).toBeNull()
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt?.id).toBe(attemptID)
+  expect((await getGoal("ses_1"))?.continuationFailures).toBe(0)
+  expect((await getGoal("ses_1"))?.status).toBe("active")
+})
