@@ -55,6 +55,8 @@ export type GoalMessages = {
   tui: {
     title: string
     commandDescription: string
+    stateTitle: string
+    stateDescription: string
     refresh: string
     refreshDescription: string
     history: string
@@ -179,6 +181,8 @@ const EN_MESSAGES: GoalMessages = {
   tui: {
     title: "Goal",
     commandDescription: "View, pause, resume, or clear the long-running session goal",
+    stateTitle: "Goal state",
+    stateDescription: "Show the goal state in a popup",
     refresh: "Refresh",
     refreshDescription: "Ask the agent to read the current goal state",
     history: "History",
@@ -282,6 +286,8 @@ const ZH_CN_MESSAGES: GoalMessages = {
   tui: {
     title: "目标",
     commandDescription: "查看、暂停、继续或清除当前会话的长期目标",
+    stateTitle: "目标状态",
+    stateDescription: "在弹窗中显示目标状态",
     refresh: "刷新",
     refreshDescription: "让 Agent 读取当前目标状态",
     history: "历史",

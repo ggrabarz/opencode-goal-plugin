@@ -3,7 +3,14 @@ import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { testRender } from "@opentui/solid"
-import plugin, { formatDuration, formatGoal, goalStateFromSession, liveTimeUsedSeconds, readPersistedGoal } from "../src/tui.ts"
+import plugin, {
+  formatDuration,
+  formatGoal,
+  goalStateFromSession,
+  goalStatusGlyph,
+  liveTimeUsedSeconds,
+  readPersistedGoal,
+} from "../src/tui.ts"
 import { atomicWriteFile } from "../src/atomic-write"
 import { messagesFor } from "../src/i18n"
 
@@ -73,7 +80,7 @@ function goal(overrides: Partial<Parameters<typeof liveTimeUsedSeconds>[0]> = {}
 }
 
 test("tui plugin registers goal sidebar and status command without hijacking /goal", async () => {
-  let registered: (() => { value: string; slash?: { name: string } }[]) | undefined
+  const registered: { value: string; keybind?: string; slash?: { name: string } }[] = []
   let sidebar: ((ctx: unknown, props: { session_id: string }) => unknown) | undefined
   const api = {
     slots: {
@@ -83,8 +90,8 @@ test("tui plugin registers goal sidebar and status command without hijacking /go
       },
     },
     command: {
-      register(cb: () => { value: string; slash?: { name: string } }[]) {
-        registered = cb
+      register(cb: () => { value: string; keybind?: string; slash?: { name: string } }[]) {
+        registered.push(...cb())
         return () => {}
       },
     },
@@ -113,9 +120,10 @@ test("tui plugin registers goal sidebar and status command without hijacking /go
   }
   await plugin.tui(api as never, undefined, undefined as never)
 
-  const commands = registered?.() ?? []
-  expect(commands.map((command) => command.value).sort()).toEqual(["goal.show"])
-  expect(commands.flatMap((command) => (command.slash ? [command.slash.name] : [])).sort()).toEqual([])
+  expect(registered.map((command) => command.value).sort()).toEqual(["goal.show", "goal.state"])
+  expect(registered.flatMap((command) => (command.slash ? [command.slash.name] : [])).sort()).toEqual([])
+  // The popup opens from a key.
+  expect(registered.find((command) => command.value === "goal.state")?.keybind).toBe("f4")
   expect(typeof sidebar?.({}, { session_id: "session" })).not.toBe("string")
 })
 
@@ -232,6 +240,58 @@ test("active goal sidebar advances visible elapsed time after a timer tick", asy
     setIntervalSpy.mockRestore()
     setSystemTime()
   }
+})
+
+test("V1 the goal state popup opens a dialog with the state the sidebar shows", async () => {
+  const snapshot = goal({ objective: "popup goal", status: "paused" })
+  const registered: { value: string; keybind?: string; onSelect?: () => void }[] = []
+  let replaced: (() => unknown) | undefined
+  let alertProps: { title: string; message: string } | undefined
+  const api = {
+    slots: { register() { return "slot-id" } },
+    command: {
+      register(cb: () => { value: string; keybind?: string; onSelect?: () => void }[]) {
+        registered.push(...cb())
+        return () => {}
+      },
+    },
+    route: { current: { name: "session", params: { sessionID: "session" } } },
+    ui: {
+      toast() {},
+      dialog: {
+        setSize() {},
+        replace(render: () => unknown) {
+          replaced = render
+        },
+        clear() {},
+      },
+      DialogAlert(props: { title: string; message: string }) {
+        alertProps = props
+        return null
+      },
+    },
+    theme: { current: { text: "#ffffff", textMuted: "#888888" } },
+    state: {
+      session: { messages: () => [{ id: "created" }] },
+      part: () => [
+        { type: "tool", tool: "create_goal", state: { status: "completed", output: JSON.stringify({ goal: snapshot }) } },
+      ],
+    },
+  }
+  await plugin.tui(api as never, undefined, undefined as never)
+
+  const command = registered.find((candidate) => candidate.value === "goal.state")
+  expect(command).toBeDefined()
+  expect(command?.keybind).toBe("f4")
+  await command?.onSelect?.()
+  // The popup reads the persisted state before it opens.
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  expect(replaced).toBeTypeOf("function")
+  replaced?.()
+  expect(alertProps?.message).toContain("popup goal")
+  expect(alertProps?.message).toContain("Status: paused")
+  expect(alertProps?.title).toContain(goalStatusGlyph("paused"))
 })
 
 test("V1 sidebar refreshes persisted counters without another goal tool result", async () => {

@@ -126,6 +126,15 @@ export function goalStatusGlyph(status: GoalStatus): string {
   return GOAL_STATUS_GLYPHS[status] ?? GOAL_STATUS_GLYPHS.active
 }
 
+/**
+ * The key that opens the goal state popup.
+ *
+ * The local OpenRouter limits plugin owns f3, the host binds f2 for model
+ * cycling, and nothing else claims f4. The command has an id, so the key can
+ * be changed in the OpenCode configuration like any other keybind.
+ */
+export const GOAL_STATE_KEYBIND = "f4"
+
 function element(tag: string, props: Record<string, unknown>, children: ElementChild[] = []) {
   const node = createElement(tag)
   for (const [key, value] of Object.entries(props)) if (value !== undefined) setProp(node, key, value)
@@ -608,6 +617,29 @@ type GoalStateColors = {
 }
 
 /**
+ * Resolves the goal the surfaces show.
+ *
+ * The persisted state file and the session messages are two views of the same
+ * goal: the file is written by the server, the messages carry the tool result
+ * the agent saw. The newer of the two wins, and a goal that was cleared in the
+ * messages is gone. Every surface resolves the goal through this function, so
+ * the sidebar, the popup and the input box icon always agree.
+ */
+export function resolveGoal(
+  persisted: GoalSnapshot | null | undefined,
+  fromMessages: GoalSnapshot | null | undefined,
+  fallback: GoalSnapshot | null = null,
+): GoalSnapshot | null {
+  if (fromMessages === null) return null
+  if (persisted !== undefined) {
+    if (fromMessages && persisted && (fromMessages.createdAt > persisted.createdAt || fromMessages.updatedAt > persisted.updatedAt))
+      return fromMessages
+    return persisted
+  }
+  return fromMessages === undefined ? fallback : fromMessages
+}
+
+/**
  * Renders the shared goal state lines as text elements.
  *
  * The sidebar and the popup read the same lines, so only the colours differ
@@ -626,12 +658,7 @@ function GoalSidebar(api: TuiPluginApi, messages: GoalMessages, locale: ReturnTy
   const state = goalStateFromSession(api, sessionID)
   if (!state.goal) return null
   const persisted = usePersistedGoal(sessionID)
-  const goal = createMemo(() => {
-    const live = persisted()
-    if (live === undefined) return state.goal
-    if (live && state.goal && (state.goal.createdAt > live.createdAt || state.goal.updatedAt > live.updatedAt)) return state.goal
-    return live
-  })
+  const goal = createMemo(() => resolveGoal(persisted(), state.goal))
   const [nowSeconds, setNowSeconds] = createSignal(currentEpochSeconds())
   const active = createMemo(() => goal()?.status === "active")
   createEffect(() => {
@@ -648,6 +675,38 @@ function GoalSidebar(api: TuiPluginApi, messages: GoalMessages, locale: ReturnTy
       achieved: theme.primary,
     }))
   }])
+}
+
+/**
+ * The popup that shows the goal state, for the V1 TUI.
+ *
+ * The sidebar is not rendered on a narrow window, so the state has to stay
+ * reachable without it. The popup reads the same goal and renders the same
+ * lines as the sidebar, so the two can never show different values.
+ */
+async function showGoalStatePopupV1(
+  api: TuiPluginApi,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+) {
+  const sessionID = currentSessionID(api)
+  if (!sessionID) {
+    toast(api, messages, messages.tui.openSession, "warning")
+    return
+  }
+  const goal = resolveGoal(await readPersistedGoal(sessionID), goalFromSession(api, sessionID))
+  const title = goal ? `${goalStatusGlyph(goal.status)} ${messages.tui.title}` : messages.tui.title
+  const message = goal
+    ? goalStateLines(goal, messages, locale)
+        .map((line) => line.text)
+        .join("\n")
+    : messages.tui.noGoal
+  try {
+    api.ui.dialog.setSize("large")
+    api.ui.dialog.replace(() => api.ui.DialogAlert({ title, message }))
+  } catch (error) {
+    toast(api, messages, error instanceof Error ? error.message : String(error), "error")
+  }
 }
 
 function registerGoalCommand(api: TuiPluginApi, command: TuiCommand) {
@@ -694,6 +753,22 @@ const tui: TuiPlugin = async (api, options) => {
       showSummary(api, messages, locale, sessionID, goalFromSession(api, sessionID))
     },
   })
+
+  // The legacy command API is the one that carries a keybind, so the popup
+  // opens from a key there. It is deprecated, but it is the shape that the
+  // V1 host still honours.
+  api.command?.register(() => [
+    {
+      title: messages.tui.stateTitle,
+      value: "goal.state",
+      category: messages.tui.title,
+      description: messages.tui.stateDescription,
+      keybind: GOAL_STATE_KEYBIND,
+      onSelect: () => {
+        void showGoalStatePopupV1(api, messages, locale)
+      },
+    },
+  ])
 }
 
 // --- V2 TUI plugin ---
@@ -811,12 +886,7 @@ function GoalSidebarV2(
   const goal = createMemo<GoalSnapshot | null>(() => {
     const found = messageGoal()
     if (found === null) return null
-    const live = persisted()
-    if (live !== undefined) {
-      if (found && live && (found.createdAt > live.createdAt || found.updatedAt > live.updatedAt)) return found
-      return live
-    }
-    return found === undefined ? cache.goal : found
+    return resolveGoal(persisted(), found, cache.goal)
   })
   createEffect(() =>
     setCache((draft) => {
@@ -842,6 +912,50 @@ function GoalSidebarV2(
   }])
 }
 
+/**
+ * The popup that shows the goal state.
+ *
+ * The sidebar is not rendered on a narrow window, so the state has to stay
+ * reachable without it. The popup reads the same goal and renders the same
+ * lines as the sidebar, so the two can never show different values.
+ */
+async function showGoalStatePopupV2(
+  api: TuiPluginV2.Context,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+) {
+  const sessionID = currentSessionIDV2(api)
+  if (!sessionID) {
+    toastV2(api, messages, messages.tui.openSession, "warning")
+    return
+  }
+  const goal = resolveGoal(
+    await readPersistedGoal(sessionID),
+    goalFromV2Messages(api.data.session.message.list(sessionID)),
+  )
+  const title = goal ? `${goalStatusGlyph(goal.status)} ${messages.tui.title}` : messages.tui.title
+  const message = goal
+    ? goalStateLines(goal, messages, locale)
+        .map((line) => line.text)
+        .join("\n")
+    : messages.tui.noGoal
+  try {
+    const closed = api.ui.dialog.alert({ title, message })
+    // The dialog host resets its presentation while it pushes the alert onto
+    // the stack, so the size is applied after the alert was pushed.
+    try {
+      api.ui.dialog.set({ size: "large", centered: true })
+    } catch {
+      // The presentation options are best effort.
+    }
+    await closed
+  } catch (error) {
+    // The command runs detached, so a rejection here would be an unhandled
+    // rejection in the host's TUI process.
+    toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
+  }
+}
+
 function GoalKeymapLayerV2(api: TuiPluginV2.Context, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>) {
   api.keymap.layer(() => ({
     mode: "global",
@@ -860,6 +974,17 @@ function GoalKeymapLayerV2(api: TuiPluginV2.Context, messages: GoalMessages, loc
           }
           const goal = goalFromV2Messages(api.data.session.message.list(sessionID)) ?? null
           void showSummaryV2(api, messages, locale, sessionID, goal)
+        },
+      },
+      {
+        id: "goal.state",
+        title: messages.tui.stateTitle,
+        description: messages.tui.stateDescription,
+        group: messages.tui.title,
+        palette: true,
+        bind: GOAL_STATE_KEYBIND,
+        run: () => {
+          void showGoalStatePopupV2(api, messages, locale)
         },
       },
     ],
