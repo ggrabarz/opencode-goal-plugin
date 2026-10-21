@@ -3042,3 +3042,20 @@ test("V2 a failing tool hook does not fail the tool call", async () => {
   mock.stream.end()
   await cleanup()
 })
+
+test("V2 a failing session hook does not reject the hook", async () => {
+  // The prompt and compaction hooks run on the host's critical paths and read
+  // the goal state. A state failure inside one of them must not reject the
+  // hook, or the host reports the user's own prompt as failed.
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const compaction = mock.hooks["compaction"]
+  expect(compaction).toBeDefined()
+  await compaction!({ sessionID: "ses_v2", system: [] } as never)
+
+  mock.stream.end()
+  await cleanup()
+})

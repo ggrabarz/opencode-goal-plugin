@@ -4418,3 +4418,17 @@ test("V1 a failing tool hook does not fail the tool call", async () => {
   await before!({ tool: "bash", sessionID: "ses_1", callID: "call_1", args: {} } as never, output as never)
   await after!({ tool: "bash", sessionID: "ses_1", callID: "call_1", args: {} } as never, output as never)
 })
+
+test("V1 a failing message hook does not reject the hook", async () => {
+  // The message hook runs on every message and writes the goal state. A state
+  // failure inside it must not reject the hook, or the host reports the
+  // user's own message as failed.
+  const client = { session: { promptAsync: async () => {} } }
+  const hooks = await setupServer({ client } as never, { auto_continue: false })
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const chat = hooks["chat.message"]
+  expect(chat).toBeDefined()
+  await chat!({ sessionID: "ses_1", agent: "build" } as never, { message: { id: "m1", parts: [] } } as never)
+})
