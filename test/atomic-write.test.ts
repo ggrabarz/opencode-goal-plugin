@@ -3,6 +3,7 @@ import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promise
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
+  OPEN_ATTEMPTS,
   RENAME_ATTEMPTS,
   RENAME_RETRY_DELAY_MS,
   RENAME_RETRY_MAX_DELAY_MS,
@@ -626,4 +627,40 @@ test("a non-transient rename error is never retried", async () => {
   expect(opsCalled()).toEqual(["open", "write", "sync", "close", "rename", "unlink"])
   expect(await readFile(file, "utf8")).toBe("old state")
   expect(await leftoverTmpFiles()).toEqual([])
+})
+
+test("a transient exclusive create of the temp file is retried", async () => {
+  // Creating the temp file can fail the same way the rename does: on Windows a
+  // directory that another process is modifying can make an exclusive create
+  // fail with EPERM. A failed write loses a goal update, so the create is
+  // retried with a bounded budget.
+  let attempts = 0
+  const { ops } = makeRecordingOps({
+    ops: {
+      platform: "win32",
+      async open(path, flags, mode) {
+        attempts += 1
+        if (attempts === 1) throw errno("EPERM", "operation not permitted")
+        return defaultAtomicWriteOps.open(path, flags, mode)
+      },
+    },
+  })
+  await atomicWriteFile(file, "payload", ops)
+  expect(attempts).toBe(2)
+  expect(await readFile(file, "utf8")).toBe("payload")
+})
+
+test("a persistent exclusive create failure is not retried forever", async () => {
+  let attempts = 0
+  const { ops } = makeRecordingOps({
+    ops: {
+      platform: "win32",
+      async open() {
+        attempts += 1
+        throw errno("EPERM", "operation not permitted")
+      },
+    },
+  })
+  await expect(atomicWriteFile(file, "payload", ops)).rejects.toThrow()
+  expect(attempts).toBe(OPEN_ATTEMPTS)
 })

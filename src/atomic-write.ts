@@ -97,6 +97,39 @@ export function isTransientRenameError(error: unknown, platform: NodeJS.Platform
   return code === "EPERM" || code === "EACCES" || code === "EBUSY"
 }
 
+/**
+ * Total attempts for a transient exclusive create of the temp file.
+ *
+ * Creating the temp file can fail the same way the rename does: on Windows a
+ * directory that another process is modifying, or a scanner that is walking
+ * it, can make an exclusive create fail with EPERM even though nothing is
+ * holding the temp path. The write is the most important operation in the
+ * plugin, because a failed write loses a goal update, so the create is
+ * retried with the same bounded budget as the rename.
+ */
+export const OPEN_ATTEMPTS = 10
+
+/**
+ * Open the temp file, retrying a transient exclusive-create failure.
+ */
+async function openWithRetry(
+  ops: AtomicWriteOps,
+  path: string,
+  flags: string | number,
+  mode: number,
+): Promise<FileHandleOps> {
+  let attempt = 0
+  for (;;) {
+    try {
+      return await ops.open(path, flags, mode)
+    } catch (error) {
+      attempt += 1
+      if (!isTransientRenameError(error, ops.platform) || attempt >= OPEN_ATTEMPTS) throw error
+      await ops.sleep(renameRetryDelayMs(attempt))
+    }
+  }
+}
+
 async function bestEffort(action: () => void | Promise<void>): Promise<void> {
   try {
     await action()
@@ -272,7 +305,7 @@ export async function atomicWriteFile(
     // "wx" = create exclusively: fail with EEXIST if the temp path already
     // exists, so an accidental collision can never clobber another writer's
     // file. The UUID name makes collisions effectively impossible anyway.
-    handle = await ops.open(tmp, "wx", 0o600)
+    handle = await openWithRetry(ops, tmp, "wx", 0o600)
     created = true
     await handle.write(data)
     await handle.sync()
