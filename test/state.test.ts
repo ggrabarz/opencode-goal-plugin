@@ -34,14 +34,19 @@ import {
 } from "../src/state"
 
 let dir = ""
+let previousStatePath: string | undefined
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-"))
+  previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
   process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals.json")
 })
 
 afterEach(async () => {
-  delete process.env.OPENCODE_GOAL_STATE_PATH
+  // The state path is restored rather than removed: the default path is the
+  // goal state of the running plugin, which a test run must never touch.
+  if (previousStatePath === undefined) delete process.env.OPENCODE_GOAL_STATE_PATH
+  else process.env.OPENCODE_GOAL_STATE_PATH = previousStatePath
   await rm(dir, { recursive: true, force: true })
 })
 

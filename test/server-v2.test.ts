@@ -278,6 +278,7 @@ async function createGoalViaV2Tool(mock: MockContext, objective: string, agent =
 }
 
 let dir = ""
+let previousStatePath: string | undefined
 const setupDisposers: Array<() => void | Promise<void>> = []
 
 async function setupPlugin(...args: Parameters<typeof plugin.setup>) {
@@ -296,12 +297,16 @@ async function setupPlugin(...args: Parameters<typeof plugin.setup>) {
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-v2-"))
+  previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
   process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals.json")
 })
 
 afterEach(async () => {
   for (const dispose of setupDisposers.splice(0).reverse()) await dispose()
-  delete process.env.OPENCODE_GOAL_STATE_PATH
+  // The state path is restored rather than removed: the default path is the
+  // goal state of the running plugin, which a test run must never touch.
+  if (previousStatePath === undefined) delete process.env.OPENCODE_GOAL_STATE_PATH
+  else process.env.OPENCODE_GOAL_STATE_PATH = previousStatePath
   await rm(dir, { recursive: true, force: true })
 })
 
