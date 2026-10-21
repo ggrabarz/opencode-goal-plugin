@@ -29,6 +29,17 @@ export function stateLockPath(stateFile: string) {
   return `${stateFile}.lock`
 }
 
+/**
+ * The state file a lock path belongs to.
+ *
+ * The lock path is the state path with a `.lock` suffix, so the state file it
+ * protects can be recovered from it. A failure to take the lock is reported
+ * next to that state file, not next to the global one.
+ */
+export function stateFileFromLockPath(lockPath: string) {
+  return lockPath.endsWith(".lock") ? lockPath.slice(0, -".lock".length) : lockPath
+}
+
 export type StateLock = { release: () => Promise<void>; held: boolean }
 
 export type StateLockOptions = {
@@ -76,6 +87,7 @@ export async function acquireStateLock(lockPath: string, options: StateLockOptio
         reportPluginError(
           `Could not create the state lock at ${lockPath}`,
           error instanceof Error ? error : new Error(String(code ?? "unknown error")),
+          stateFileFromLockPath(lockPath),
         )
         return { held: false, release: async () => {} }
       }
@@ -90,7 +102,7 @@ export async function acquireStateLock(lockPath: string, options: StateLockOptio
         // The lock is gone: the failure was a transient one, so retry.
       }
       if (Date.now() >= deadline) {
-        reportPluginError(`Gave up waiting for the state lock at ${lockPath}`)
+        reportPluginError(`Gave up waiting for the state lock at ${lockPath}`, undefined, stateFileFromLockPath(lockPath))
         return { held: false, release: async () => {} }
       }
       await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS))

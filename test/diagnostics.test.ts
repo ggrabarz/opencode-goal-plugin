@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { existsSync } from "node:fs"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -54,6 +55,23 @@ test("reporting a plugin error never throws", async () => {
     // A state path whose parent cannot be created must not propagate.
     process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals.json")
     expect(() => reportPluginError("still reported")).not.toThrow()
+  })
+})
+
+test("a reported plugin error is written next to the state file it is about", async () => {
+  await withStatePath(async () => {
+    // A failure of one state file must not land in the log of another one.
+    const other = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-other-"))
+    try {
+      reportPluginError("Gave up waiting for the state lock", undefined, join(other, "goals.json"))
+      // The entry is next to the state file the failure is about...
+      const beside = await readFile(join(other, "goal-plugin.log"), "utf8")
+      expect(beside).toContain("Gave up waiting for the state lock")
+      // ...and not in the log of the global state file.
+      expect(existsSync(diagnosticsLogPath())).toBe(false)
+    } finally {
+      await rm(other, { recursive: true, force: true })
+    }
   })
 })
 
