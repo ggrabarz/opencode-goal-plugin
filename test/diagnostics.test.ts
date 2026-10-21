@@ -73,3 +73,19 @@ test("the error description stops at a bounded depth", () => {
   for (let depth = 0; depth < 20; depth++) error = { cause: error }
   expect(describeError(error).length).toBeLessThan(2000)
 })
+
+test("the error description unwraps a real Effect fiber failure", async () => {
+  // This is the shape the state layer produces: a FiberFailure whose message
+  // says nothing, with the real error behind Effect's cause symbol.
+  const { Effect } = await import("effect-goal-state")
+  let failure: unknown
+  try {
+    Effect.runSync(Effect.fail(new Error("EPERM: rename failed")))
+  } catch (error) {
+    failure = error
+  }
+  expect(failure).toBeDefined()
+  const description = describeError(failure)
+  expect(description).toContain("EPERM")
+  expect(description).toContain("rename failed")
+})
