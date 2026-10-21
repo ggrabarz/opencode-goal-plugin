@@ -46,6 +46,44 @@ function rotateIfNeeded(path: string) {
 }
 
 /**
+ * Describe an error and the causes behind it.
+ *
+ * The plugin's state layer reports failures through Effect, so the error that
+ * reaches a caller is often a FiberFailure whose message is just "An error
+ * has occurred". The real reason - a failed rename, a full disk, a state file
+ * that changed underneath - only lives in the cause chain, so the chain has to
+ * be unwrapped or the diagnostics say nothing useful.
+ */
+export function describeError(error: unknown, depth = 0): string {
+  if (error == null) return String(error)
+  if (typeof error === "string") return error
+  if (typeof error !== "object") return String(error)
+  if (depth > 6) return "..."
+  const record = error as Record<string, unknown>
+  const tag =
+    typeof record._tag === "string"
+      ? record._tag
+      : typeof record.name === "string"
+        ? record.name
+        : typeof record.constructor === "string"
+          ? record.constructor
+          : "Error"
+  const message = typeof record.message === "string" ? record.message : ""
+  const head = message && message !== tag ? `${tag}: ${message}` : tag
+  const cause = record.cause
+  if (cause == null) return head
+  if (typeof cause === "string") return `${head} <- ${cause}`
+  if (typeof cause === "object") {
+    // Effect's internal Cause carries a readable rendering.
+    const pretty = (cause as Record<string, unknown>).pretty
+    if (typeof pretty === "string" && pretty.trim()) {
+      return `${head} <- ${pretty.split("\n").map((line) => line.trim()).filter(Boolean).join(" | ")}`
+    }
+  }
+  return `${head} <- ${describeError(cause, depth + 1)}`
+}
+
+/**
  * Append one diagnostics line. Never throws: a failing diagnostics writer
  * must not turn a recoverable plugin error into a crash.
  */
@@ -54,10 +92,7 @@ export function reportPluginError(message: string, error?: unknown) {
     const path = diagnosticsLogPath()
     mkdirSync(dirname(path), { recursive: true })
     rotateIfNeeded(path)
-    const detail =
-      error === undefined
-        ? ""
-        : ` | ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`
+    const detail = error === undefined ? "" : ` | ${describeError(error)}`
     appendFileSync(path, `${new Date().toISOString()} | error | ${message}${detail}\n`)
   } catch {
     // Diagnostics must never break plugin control flow.
