@@ -438,8 +438,8 @@ function statePath() {
 
 // src/diagnostics.ts
 var MAX_LOG_BYTES = 1024 * 1024;
-function diagnosticsLogPath() {
-  return join2(dirname2(statePath()), "goal-plugin.log");
+function diagnosticsLogPath(stateFile) {
+  return join2(dirname2(stateFile ?? statePath()), "goal-plugin.log");
 }
 function rotateIfNeeded(path) {
   let size;
@@ -507,9 +507,9 @@ function describeError(error, depth = 0) {
   }
   return `${head} <- ${describeError(cause, depth + 1)}`;
 }
-function reportPluginError(message, error) {
+function reportPluginError(message, error, stateFile) {
   try {
-    const path = diagnosticsLogPath();
+    const path = diagnosticsLogPath(stateFile);
     mkdirSync(dirname2(path), { recursive: true });
     rotateIfNeeded(path);
     const detail = error === undefined ? "" : ` | ${describeError(error)}`;
@@ -525,6 +525,9 @@ var LOCK_TIMEOUT_MS = 5000;
 var LOCK_RETRY_MS = 20;
 function stateLockPath(stateFile) {
   return `${stateFile}.lock`;
+}
+function stateFileFromLockPath(lockPath) {
+  return lockPath.endsWith(".lock") ? lockPath.slice(0, -".lock".length) : lockPath;
 }
 async function acquireStateLock(lockPath, options = {}) {
   const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
@@ -548,7 +551,7 @@ async function acquireStateLock(lockPath, options = {}) {
       const code = error?.code;
       const contended = code === "EEXIST" || code === "EPERM" || code === "EACCES";
       if (!contended) {
-        reportPluginError(`Could not create the state lock at ${lockPath}`, error instanceof Error ? error : new Error(String(code ?? "unknown error")));
+        reportPluginError(`Could not create the state lock at ${lockPath}`, error instanceof Error ? error : new Error(String(code ?? "unknown error")), stateFileFromLockPath(lockPath));
         return { held: false, release: async () => {} };
       }
       try {
@@ -559,7 +562,7 @@ async function acquireStateLock(lockPath, options = {}) {
         }
       } catch {}
       if (Date.now() >= deadline) {
-        reportPluginError(`Gave up waiting for the state lock at ${lockPath}`);
+        reportPluginError(`Gave up waiting for the state lock at ${lockPath}`, undefined, stateFileFromLockPath(lockPath));
         return { held: false, release: async () => {} };
       }
       await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
@@ -757,7 +760,7 @@ function notifyStateRecovery(notice) {
       try {
         console.error(`[opencode-goal-plugin] Failed to report quarantined state at ${notice.quarantineFile}:`, error instanceof Error ? error.message : String(error));
       } catch {}
-      reportPluginError(`Failed to report quarantined state at ${notice.quarantineFile}`, error);
+      reportPluginError(`Failed to report quarantined state at ${notice.quarantineFile}`, error, notice.stateFile);
     });
   }
 }
@@ -822,7 +825,7 @@ function verifyRecoverySourceEffect(file, expectedContent, quarantineFile) {
         try {
           console.error(`[opencode-goal-plugin] Could not re-read ${file} after preserving it at ${quarantineFile}; continuing recovery:`, error instanceof Error ? error.message : String(error));
         } catch {}
-        reportPluginError(`Could not re-read ${file} after preserving it at ${quarantineFile}`, error);
+        reportPluginError(`Could not re-read ${file} after preserving it at ${quarantineFile}`, error, file);
       }
       return true;
     }
@@ -888,7 +891,7 @@ async function mutate(fn) {
               try {
                 console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
               } catch {}
-              reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error);
+              reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error, file);
               notifyStateRecovery(notice);
             } else {
               const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile);
