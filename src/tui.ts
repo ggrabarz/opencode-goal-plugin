@@ -2,7 +2,7 @@ import type { TuiCommand, TuiPlugin, TuiPluginApi, TuiPluginModule } from "@open
 import type { Plugin as TuiPluginV2 } from "@opencode/plugin/tui"
 import type { SessionMessageInfo } from "@opencode/client"
 import { createElement, insert, setProp } from "@opentui/solid"
-import { createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import { createEffect, createMemo, createRoot, createSignal, onCleanup } from "solid-js"
 import { readFile, stat } from "node:fs/promises"
 import type { GoalMessages } from "./i18n"
 import { messagesFor, presentGoalLastStatus, presentGoalStatus, presentGoalStopReason, resolveLocale } from "./i18n"
@@ -204,6 +204,32 @@ function goalColorsV2(theme: unknown) {
     muted: themeColorV2(theme, ["text", "muted"], ["text", "subdued"], ["textMuted"]),
     achieved: themeColorV2(theme, ["text", "feedback", "success"], ["primary"], ["text", "base"], ["text", "default"], ["text"]),
   }
+}
+
+/**
+ * The colour that stands for a goal status in the input box.
+ *
+ * The status is told by the glyph; the colour tells it at a glance: a goal
+ * that runs is bright, a goal that waits is muted, a goal that hit a limit
+ * warns and a goal that failed is an error.
+ */
+export function goalStatusColorV2(status: GoalStatus, theme: unknown) {
+  if (status === "active") return themeColorV2(theme, ["text", "base"], ["text", "default"], ["text"])
+  if (status === "complete")
+    return themeColorV2(theme, ["text", "feedback", "success"], ["primary"], ["text", "base"], ["text", "default"], ["text"])
+  if (status === "unmet") return themeColorV2(theme, ["text", "feedback", "error"], ["error"], ["text", "base"], ["text", "default"], ["text"])
+  if (status === "budgetLimited" || status === "usageLimited")
+    return themeColorV2(theme, ["text", "feedback", "warning"], ["warning"], ["text", "base"], ["text", "default"], ["text"])
+  return themeColorV2(theme, ["text", "muted"], ["text", "subdued"], ["textMuted"])
+}
+
+/** The V1 counterpart of the input box status colour. */
+export function goalStatusColorV1(status: GoalStatus, theme: { text: unknown; textMuted: unknown; warning: unknown; success: unknown; error: unknown }) {
+  if (status === "active") return theme.text
+  if (status === "complete") return theme.success
+  if (status === "unmet") return theme.error
+  if (status === "budgetLimited" || status === "usageLimited") return theme.warning
+  return theme.textMuted
 }
 
 function goalSnapshotKey(sessionID: string) {
@@ -480,33 +506,72 @@ export async function readPersistedGoal(sessionID: string): Promise<GoalSnapshot
 }
 
 function usePersistedGoal(sessionID: string) {
-  const [persisted, setPersisted] = createSignal<GoalSnapshot | null | undefined>(undefined)
-  let disposed = false
-  let reading = false
-  let lastFile: { ino: number; mtimeMs: number; size: number } | undefined
-  const refresh = async () => {
-    if (reading) return
-    reading = true
-    try {
-      const file = await stat(statePath())
-      if (lastFile && lastFile.ino === file.ino && lastFile.mtimeMs === file.mtimeMs && lastFile.size === file.size) return
-      const next = await readPersistedGoal(sessionID)
-      if (next === undefined) return
-      lastFile = { ino: file.ino, mtimeMs: file.mtimeMs, size: file.size }
-      if (!disposed && (next !== null || persisted() !== undefined)) setPersisted(() => next)
-    } catch {
-      // Missing or unreadable state leaves the last valid view in place.
-    } finally {
-      reading = false
-    }
-  }
-  void refresh()
-  const timer = setInterval(() => void refresh(), 1000)
+  const store = persistedGoalStore(sessionID)
+  store.refs += 1
   onCleanup(() => {
-    disposed = true
-    clearInterval(timer)
+    store.refs -= 1
+    if (store.refs <= 0) store.dispose()
   })
-  return persisted
+  return store.persisted
+}
+
+type PersistedGoalStore = {
+  readonly persisted: () => GoalSnapshot | null | undefined
+  refs: number
+  readonly dispose: () => void
+}
+
+const persistedGoalStores = new Map<string, PersistedGoalStore>()
+
+/**
+ * The persisted goal of one session, shared by every surface.
+ *
+ * The sidebar, the input box icon and the popup all read the goal through
+ * one signal, so they cannot show different values, and they refresh
+ * together: one poller, one update, every surface at once. The store lives in
+ * a detached root, so it survives a surface that is re-created (the host
+ * re-creates the prompt on a model or session switch) and is released when
+ * the last surface that uses it goes away.
+ */
+function persistedGoalStore(sessionID: string): PersistedGoalStore {
+  const existing = persistedGoalStores.get(sessionID)
+  if (existing) return existing
+  const store = createRoot((disposeRoot) => {
+    const [persisted, setPersisted] = createSignal<GoalSnapshot | null | undefined>(undefined)
+    let disposed = false
+    let reading = false
+    let lastFile: { ino: number; mtimeMs: number; size: number } | undefined
+    const refresh = async () => {
+      if (reading) return
+      reading = true
+      try {
+        const file = await stat(statePath())
+        if (lastFile && lastFile.ino === file.ino && lastFile.mtimeMs === file.mtimeMs && lastFile.size === file.size) return
+        const next = await readPersistedGoal(sessionID)
+        if (next === undefined) return
+        lastFile = { ino: file.ino, mtimeMs: file.mtimeMs, size: file.size }
+        if (!disposed && (next !== null || persisted() !== undefined)) setPersisted(() => next)
+      } catch {
+        // Missing or unreadable state leaves the last valid view in place.
+      } finally {
+        reading = false
+      }
+    }
+    void refresh()
+    const timer = setInterval(() => void refresh(), 1000)
+    return {
+      persisted,
+      refs: 0,
+      dispose: () => {
+        disposed = true
+        clearInterval(timer)
+        persistedGoalStores.delete(sessionID)
+        disposeRoot()
+      },
+    } satisfies PersistedGoalStore
+  })
+  persistedGoalStores.set(sessionID, store)
+  return store
 }
 
 function parseGoalToolOutput(part: GoalToolPart): GoalSnapshot | null | undefined {
@@ -658,7 +723,7 @@ function GoalSidebar(api: TuiPluginApi, messages: GoalMessages, locale: ReturnTy
   const state = goalStateFromSession(api, sessionID)
   if (!state.goal) return null
   const persisted = usePersistedGoal(sessionID)
-  const goal = createMemo(() => resolveGoal(persisted(), state.goal))
+  const goal = createMemo(() => resolveGoal(persisted(), state.goal ?? undefined))
   const [nowSeconds, setNowSeconds] = createSignal(currentEpochSeconds())
   const active = createMemo(() => goal()?.status === "active")
   createEffect(() => {
@@ -694,7 +759,10 @@ async function showGoalStatePopupV1(
     toast(api, messages, messages.tui.openSession, "warning")
     return
   }
-  const goal = resolveGoal(await readPersistedGoal(sessionID), goalFromSession(api, sessionID))
+  const goal = resolveGoal(
+    await readPersistedGoal(sessionID),
+    goalFromSession(api, sessionID) ?? undefined,
+  )
   const title = goal ? `${goalStatusGlyph(goal.status)} ${messages.tui.title}` : messages.tui.title
   const message = goal
     ? goalStateLines(goal, messages, locale)
@@ -707,6 +775,58 @@ async function showGoalStatePopupV1(
   } catch (error) {
     toast(api, messages, error instanceof Error ? error.message : String(error), "error")
   }
+}
+
+/**
+ * The goal status icon in the input box.
+ *
+ * The status line of the input box is the one place in the prompt that a
+ * plugin owns, so the icon sits there, on the line under the model and the
+ * thinking effort. It reads the same goal the sidebar reads, through the same
+ * signal, so the icon and the sidebar always show the same status and change
+ * at the same moment.
+ */
+function GoalStatusIconV2(api: TuiPluginV2.Context, sessionID: string | undefined) {
+  const id = sessionID ?? currentSessionIDV2(api)
+  const persisted = id ? usePersistedGoal(id) : undefined
+  const messageGoal = createMemo(() => (id ? goalFromV2Messages(api.data.session.message.list(id)) : undefined))
+  const goal = createMemo(() => resolveGoal(persisted?.(), messageGoal()))
+  return box({}, [() => {
+    const snapshot = goal()
+    // Without a goal the box stays empty, so the input box keeps its height.
+    if (!snapshot) return null
+    return text({ fg: goalStatusColorV2(snapshot.status, api.theme) }, [goalStatusGlyph(snapshot.status)])
+  }])
+}
+
+/**
+ * The goal status icon next to the prompt, for the V1 TUI.
+ *
+ * The V1 host has no status line inside the prompt, so the icon goes to the
+ * right of the prompt instead.
+ */
+function GoalStatusIconV1(api: TuiPluginApi, sessionID: string | undefined) {
+  const id = sessionID ?? currentSessionID(api)
+  const persisted = id ? usePersistedGoal(id) : undefined
+  const messageGoal = createMemo(() => (id ? goalFromSession(api, id) ?? undefined : undefined))
+  const goal = createMemo(() => resolveGoal(persisted?.(), messageGoal()))
+  return box({}, [() => {
+    const snapshot = goal()
+    if (!snapshot) return null
+    const theme = api.theme.current
+    return text(
+      {
+        fg: goalStatusColorV1(snapshot.status, {
+          text: theme.text,
+          textMuted: theme.textMuted,
+          warning: theme.warning,
+          success: theme.success,
+          error: theme.error,
+        }),
+      },
+      [goalStatusGlyph(snapshot.status)],
+    )
+  }])
 }
 
 function registerGoalCommand(api: TuiPluginApi, command: TuiCommand) {
@@ -738,6 +858,11 @@ const tui: TuiPlugin = async (api, options) => {
     slots: {
       sidebar_content(_ctx, props) {
         return GoalSidebar(api, messages, locale, props.session_id)
+      },
+      // The V1 host has no status line inside the prompt, so the icon goes to
+      // the right of the prompt.
+      session_prompt_right(_ctx, props) {
+        return GoalStatusIconV1(api, props.session_id)
       },
     },
   })
@@ -1006,9 +1131,16 @@ export function setupTuiV2(context: TuiPluginV2.Context): TuiPluginV2.Cleanup {
   const offSidebar = registerSlotV2(context, "sidebar.content", (props) =>
     GoalSidebarV2(context, messages, locale, props.sessionID),
   )
+  // The status line of the input box: the icon sits under the model and the
+  // thinking effort, in the one place of the prompt that a plugin owns. The
+  // status slot publishes the session id as an optional value.
+  const offStatus = registerSlotV2(context, "prompt.footer.status", (props) =>
+    GoalStatusIconV2(context, (props as { sessionID?: string }).sessionID),
+  )
   const offApp = registerSlotV2(context, "app", () => GoalKeymapLayerV2(context, messages, locale))
   return () => {
     offSidebar()
+    offStatus()
     offApp()
   }
 }

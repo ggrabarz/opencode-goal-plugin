@@ -294,6 +294,56 @@ test("V1 the goal state popup opens a dialog with the state the sidebar shows", 
   expect(alertProps?.title).toContain(goalStatusGlyph("paused"))
 })
 
+test("V1 the goal status icon sits next to the prompt", async () => {
+  const snapshot = goal({ objective: "v1 icon", status: "active" })
+  let promptRight: ((ctx: unknown, props: { session_id: string }) => unknown) | undefined
+  const api = {
+    slots: {
+      register(input: {
+        slots: {
+          sidebar_content: unknown
+          session_prompt_right: (ctx: unknown, props: { session_id: string }) => unknown
+        }
+      }) {
+        promptRight = input.slots.session_prompt_right
+        return "slot-id"
+      },
+    },
+    command: { register() {} },
+    route: { current: { name: "session", params: { sessionID: "session" } } },
+    ui: { toast() {}, dialog: { setSize() {}, replace() {}, clear() {} } },
+    theme: {
+      current: {
+        text: "#ffffff",
+        textMuted: "#888888",
+        primary: "#00ff00",
+        warning: "#ffcc00",
+        success: "#00ff00",
+        error: "#ff0000",
+      },
+    },
+    state: {
+      session: { messages: () => [{ id: "created" }] },
+      part: () => [
+        { type: "tool", tool: "create_goal", state: { status: "completed", output: JSON.stringify({ goal: snapshot }) } },
+      ],
+    },
+  }
+  await plugin.tui(api as never, undefined, undefined as never)
+
+  expect(promptRight).toBeTypeOf("function")
+  const setup = await testRender(() => promptRight?.({}, { session_id: "session" }) as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain(goalStatusGlyph("active"))
+    setup.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) setup.renderer.destroy()
+  }
+})
+
 test("V1 sidebar refreshes persisted counters without another goal tool result", async () => {
   let sidebar: ((ctx: unknown, props: { session_id: string }) => unknown) | undefined
   const initial = goal({ objective: "live V1 goal" })
