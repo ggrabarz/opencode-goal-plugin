@@ -2334,9 +2334,15 @@ const server: Plugin = async ({ client }, options?: Options) => {
             const attempt = pendingAttemptOf(goal)
             if (attempt != null) {
               // The pending attempt failed at the transport level: count one
-              // failure and retry at the remaining min interval.
+              // failure and retry at the remaining min interval. The attempt id
+              // is required: a fast execution can reserve a newer attempt
+              // between the read and this write, and an unconditional failure
+              // would clear that newer attempt and count a phantom failure
+              // toward the pause ceiling.
               const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
                 requirePending: true,
+                expectedGoalID: goal.id,
+                expectedAttemptID: attempt.id,
               })
               if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
               if (autoContinue && afterFailure?.status === "active") {
@@ -3074,8 +3080,14 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           if (goal?.status === "active") {
             const attempt = pendingAttemptOf(goal)
             if (attempt != null) {
+              // The attempt id is required: a fast execution can reserve a
+              // newer attempt between the read and this write, and an
+              // unconditional failure would clear that newer attempt and count
+              // a phantom failure toward the pause ceiling.
               const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures, {
                 requirePending: true,
+                expectedGoalID: goal.id,
+                expectedAttemptID: attempt.id,
               })
               if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
               if (autoContinue && afterFailure?.status === "active") {
