@@ -3906,6 +3906,8 @@ var server = async ({ client }, options) => {
         if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID))
           return;
         await runAutoContinue(sessionID, true, scheduled);
+      } catch (error) {
+        v2ErrorLog("Scheduled continuation failed", error);
       } finally {
         if (scheduledContinuations.get(sessionID) === scheduled)
           scheduledContinuations.delete(sessionID);
@@ -4481,7 +4483,7 @@ var server = async ({ client }, options) => {
 };
 function v2ErrorLog(message, error) {
   try {
-    console.error(`[opencode-goal-plugin] ${message}:`, error instanceof Error ? error.message : String(error));
+    console.error(`[opencode-goal-plugin] ${message}:`, describeError(error));
   } catch {}
   reportPluginError(message, error);
 }
@@ -4702,6 +4704,8 @@ async function setupV2(context) {
         if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID))
           return;
         await runAutoContinue(sessionID, true, scheduled);
+      } catch (error) {
+        v2ErrorLog("Scheduled continuation failed", error);
       } finally {
         if (scheduledContinuations.get(sessionID) === scheduled)
           scheduledContinuations.delete(sessionID);
