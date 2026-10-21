@@ -770,3 +770,40 @@ test("V2 palette command toasts a warning when no session is open", async () => 
     cleanup()
   }
 })
+
+test("V2 palette command toasts the failure when the dialog cannot be shown", async () => {
+  // The command runs detached, so a rejection from the dialog would be an
+  // unhandled rejection in the host's TUI process.
+  const { mock, slots, layers, setMessages, setRoute, toasts } = makeMockContext()
+  mock.ui.dialog.select = async () => {
+    throw new Error("the dialog could not be opened")
+  }
+  const cleanup = setupTuiV2(mock as never)
+  const app = slots.get("app")
+  expect(app).toBeTypeOf("function")
+
+  setMessages([
+    assistantMessage("paused", [
+      goalTool("update_goal_status", JSON.stringify({ goal: goal({ status: "paused", objective: "resume me" }) })),
+    ]),
+  ])
+  setRoute({ type: "session", sessionID: "ses_v2" })
+
+  const setup = await testRender(() => app?.({ sessionID: "" }) as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await setup.renderOnce()
+    const command = layers[0]?.()?.commands?.find((candidate) => candidate.id === "goal.show")
+    expect(command).toBeDefined()
+    command?.run()
+
+    await waitFor(() => toasts.length === 1)
+    expect(toasts[0]?.message).toContain("the dialog could not be opened")
+
+    setup.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) setup.renderer.destroy()
+    cleanup()
+  }
+})
