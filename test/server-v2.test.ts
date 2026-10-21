@@ -3022,3 +3022,23 @@ test("V2 a scheduled continuation that fails is reported instead of rejecting", 
     await cleanup()
   }
 })
+
+test("V2 a failing tool hook does not fail the tool call", async () => {
+  // A tool hook runs on every tool call and reads the goal state. A state
+  // failure inside it must not reject the hook, or the host reports the
+  // user's own command as failed.
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const before = mock.hooks["execute.before"]
+  const after = mock.hooks["execute.after"]
+  expect(before).toBeDefined()
+  expect(after).toBeDefined()
+  await before!({ tool: "bash", sessionID: "ses_v2", id: "call_1" } as never)
+  await after!({ tool: "bash", sessionID: "ses_v2", id: "call_1", status: "completed", result: { output: "done" } } as never)
+
+  mock.stream.end()
+  await cleanup()
+})
