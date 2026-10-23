@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test"
-import { existsSync, readFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, readdirSync } from "node:fs"
+import { mkdir, rename, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { satisfies } from "semver"
 
 test("published tui entrypoint shares host runtime instances via peerDependencies", () => {
@@ -21,32 +24,39 @@ test("published tui entrypoint shares host runtime instances via peerDependencie
   }
 })
 
-test("the plugin entrypoint resolves under every export condition", () => {
-  const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
-    main?: string
-    exports?: Record<string, Record<string, string>>
+test("the packed plugin resolves through Node CommonJS and ESM entrypoints", async () => {
+  const root = mkdtempSync(join(tmpdir(), "goal-package-resolution-"))
+  try {
+    const packed = Bun.spawnSync(["npm", "pack", "--ignore-scripts", "--pack-destination", root], {
+      stdout: "pipe", stderr: "pipe",
+    })
+    if (packed.exitCode !== 0) throw new Error(packed.stderr.toString())
+    const tarball = readdirSync(root).find((file) => file.endsWith(".tgz"))
+    if (!tarball) throw new Error("npm pack did not produce a package")
+    await new Bun.Archive(await Bun.file(join(root, tarball)).arrayBuffer()).extract(join(root, "unpacked"))
+    const scope = join(root, "node_modules", "@prevalentware")
+    await mkdir(scope, { recursive: true })
+    await rename(join(root, "unpacked", "package"), join(scope, "opencode-goal-plugin"))
+    const checked = Bun.spawnSync(["node", "--input-type=module", "-e", `
+      import assert from "node:assert/strict"
+      import { existsSync } from "node:fs"
+      import { createRequire } from "node:module"
+      import { resolve } from "node:path"
+      import { fileURLToPath } from "node:url"
+      const require = createRequire(resolve("consumer.cjs"))
+      const name = "@prevalentware/opencode-goal-plugin"
+      for (const [suffix, target] of [["", "dist/server.js"], ["/server", "dist/server.js"], ["/tui", "src/tui.ts"]]) {
+        const expected = resolve("node_modules", name, target)
+        assert.ok(existsSync(expected), "Missing published entrypoint: " + expected)
+        assert.equal(require.resolve(name + suffix), expected)
+        assert.equal(fileURLToPath(import.meta.resolve(name + suffix)), expected)
+      }
+    `], { cwd: root, stdout: "pipe", stderr: "pipe" })
+    if (checked.exitCode !== 0) throw new Error(checked.stderr.toString())
+  } finally {
+    await rm(root, { recursive: true, force: true })
   }
-
-  // The host resolves the plugin entrypoint through the exports map, and it
-  // falls back to the main entry when the subpath does not resolve. A
-  // subpath that only answers to the "import" condition leaves the plugin
-  // unresolvable for a host that resolves it under another condition, and the
-  // host reports that as "Plugin entrypoint not found" and then as "Location
-  // plugins did not finish activating".
-  for (const subpath of ["./server", "./tui"]) {
-    const conditions = packageJson.exports?.[subpath]
-    expect(conditions).toBeDefined()
-    const target = conditions?.default
-    expect(target).toBeString()
-    if (typeof target !== "string") throw new Error(`expected ${subpath} to have a default condition`)
-    expect(existsSync(target)).toBe(true)
-  }
-
-  // The main entry is the fallback the host uses when the subpath does not
-  // resolve, so it has to point at the bundle.
-  expect(packageJson.main).toBe("./dist/server.js")
-  expect(existsSync("./dist/server.js")).toBe(true)
-})
+}, 30000)
 
 test("engines.opencode covers the V2 beta line and the V1 floor while excluding older stable releases", () => {
   const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {

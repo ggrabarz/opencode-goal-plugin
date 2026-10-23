@@ -30,6 +30,10 @@
   "type": "module",
   "main": "./dist/server.js",
   "exports": {
+    ".": {
+      "import": "./dist/server.js",
+      "default": "./dist/server.js"
+    },
     "./server": {
       "import": "./dist/server.js",
       "default": "./dist/server.js"
