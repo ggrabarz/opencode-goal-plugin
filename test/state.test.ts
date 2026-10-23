@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
-import { readFileSync } from "node:fs"
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -51,17 +50,14 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true })
 })
 
-test("state writes stay atomic: the file is always complete JSON and no temp file is left behind", async () => {
+test("state writes persist complete JSON and clean their temporary files", async () => {
   const file = process.env.OPENCODE_GOAL_STATE_PATH!
   await createGoal("ses_1", "atomic state", null)
   await accountUsage("ses_1", 10)
 
-  // The state file is replaced through a same-directory temp file and a
-  // rename, so a concurrent reader never observes a partially written
-  // document: the file on disk is always the old or the new valid version.
-  expect(() => JSON.parse(readFileSync(file, "utf8"))).not.toThrow()
-  expect(JSON.parse(readFileSync(file, "utf8")).goals.ses_1.objective).toBe("atomic state")
-  // The writer cleans up after itself: no orphaned temp file survives.
+  expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({
+    goals: { ses_1: { objective: "atomic state", tokensUsed: 10 } },
+  })
   expect((await readdir(dir)).filter((name) => name.endsWith(".tmp"))).toEqual([])
 })
 

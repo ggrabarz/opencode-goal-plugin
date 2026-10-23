@@ -27,10 +27,7 @@ const isolatedStatePath = join(isolatedStateDir, "goals.json")
 let hostTheme: ResolvedTheme | undefined
 
 async function writeGoalState(value: unknown) {
-  // Use the production atomic writer: replacing an existing file with a
-  // rename fails with EPERM on Windows while another reader (the sidebar
-  // poller below) still holds the target open, and the writer retries that
-  // transient lock instead of failing the test.
+  // Keep fixtures on the same atomic replacement and retry path as state writes.
   await atomicWriteFile(isolatedStatePath, JSON.stringify(value))
 }
 
