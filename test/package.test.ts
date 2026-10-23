@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdtempSync, readFileSync, readdirSync } from "node:fs"
+import { mkdtempSync, readFileSync, readdirSync, realpathSync } from "node:fs"
 import { mkdir, rename, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -24,7 +24,7 @@ test("published tui entrypoint shares host runtime instances via peerDependencie
   }
 })
 
-test("the packed plugin resolves through Node CommonJS and ESM entrypoints", async () => {
+test("the packed plugin resolves through Bun and Node CommonJS and ESM entrypoints", async () => {
   const root = mkdtempSync(join(tmpdir(), "goal-package-resolution-"))
   try {
     const packed = Bun.spawnSync(["npm", "pack", "--ignore-scripts", "--pack-destination", root], {
@@ -37,6 +37,11 @@ test("the packed plugin resolves through Node CommonJS and ESM entrypoints", asy
     const scope = join(root, "node_modules", "@prevalentware")
     await mkdir(scope, { recursive: true })
     await rename(join(root, "unpacked", "package"), join(scope, "opencode-goal-plugin"))
+    const name = "@prevalentware/opencode-goal-plugin"
+    const entrypoints = { "": "dist/server.js", "/server": "dist/server.js", "/tui": "src/tui.ts" }
+    for (const [suffix, target] of Object.entries(entrypoints)) {
+      expect(Bun.resolveSync(name + suffix, root)).toBe(realpathSync(join(root, "node_modules", name, target)))
+    }
     const checked = Bun.spawnSync(["node", "--input-type=module", "-e", `
       import assert from "node:assert/strict"
       import { existsSync } from "node:fs"
@@ -45,7 +50,7 @@ test("the packed plugin resolves through Node CommonJS and ESM entrypoints", asy
       import { fileURLToPath } from "node:url"
       const require = createRequire(resolve("consumer.cjs"))
       const name = "@prevalentware/opencode-goal-plugin"
-      for (const [suffix, target] of [["", "dist/server.js"], ["/server", "dist/server.js"], ["/tui", "src/tui.ts"]]) {
+      for (const [suffix, target] of Object.entries(${JSON.stringify(entrypoints)})) {
         const expected = resolve("node_modules", name, target)
         assert.ok(existsSync(expected), "Missing published entrypoint: " + expected)
         assert.equal(require.resolve(name + suffix), expected)
