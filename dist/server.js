@@ -921,7 +921,12 @@ function snapshot(goal) {
   };
 }
 function snapshotInternal(goal) {
-  return { ...snapshot(goal), pendingAttempt: goal.pendingAttempt, shellDeferrals: goal.shellDeferrals };
+  return {
+    ...snapshot(goal),
+    pendingAttempt: goal.pendingAttempt,
+    shellDeferrals: goal.shellDeferrals,
+    lastContinuationAtMs: goal.lastContinuationAtMs
+  };
 }
 async function getGoal(sessionID) {
   const state = await readState();
@@ -1577,8 +1582,12 @@ async function recordContinuationResult(sessionID, result, maxFailures, options)
       return goal ? snapshotInternal(goal) : null;
     if (options?.expectedGoalID && goal.id !== options.expectedGoalID)
       return null;
-    if (options?.expectedAttemptID && goal.pendingAttempt?.id !== options.expectedAttemptID)
+    if (options?.expectedAutoTurns != null && goal.autoTurns !== options.expectedAutoTurns)
       return null;
+    if (options?.expectedAttemptID && goal.pendingAttempt?.id !== options.expectedAttemptID) {
+      if (result !== "success" || goal.pendingAttempt != null || options.expectedAutoTurns == null)
+        return null;
+    }
     const now = nowSeconds();
     goal.updatedAt = now;
     if (result === "success") {
@@ -2886,10 +2895,9 @@ function transportErrorMessageFromEvent(props) {
 function continuationRetryDelayMs(minIntervalSeconds, attemptAt, now = Date.now()) {
   return Math.max(0, attemptAt + minIntervalSeconds * 1000 - now) + RETRY_SETTLE_MS;
 }
-function continuationDelayFromSnapshot(minIntervalSeconds, lastContinuationAt, now = Date.now()) {
-  if (lastContinuationAt == null)
-    return RETRY_SETTLE_MS;
-  return Math.max(0, (lastContinuationAt + minIntervalSeconds + 1) * 1000 - now) + RETRY_SETTLE_MS;
+function continuationDelayFromSnapshot(minIntervalSeconds, goal, now = Date.now()) {
+  const anchor = goal.lastContinuationAtMs ?? (goal.lastContinuationAt != null ? goal.lastContinuationAt * 1000 : null);
+  return anchor == null ? RETRY_SETTLE_MS : continuationRetryDelayMs(minIntervalSeconds, anchor, now);
 }
 function pendingAttemptOf(goal) {
   return goal?.pendingAttempt ?? null;
@@ -3955,8 +3963,13 @@ var server = async ({ client }, options) => {
       if (!isCurrent() || nativeRetrySessions.has(sessionID))
         return;
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
-      if (!goal)
+      if (!goal) {
+        const waiting = await getGoalInternal(sessionID);
+        if (waiting?.status === "active" && waiting.lastContinuationAt != null && minInterval > 0 && !waiting.shellDeferrals.some((item) => !item.delivered)) {
+          scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, waiting), scheduled != null);
+        }
         return;
+      }
       attemptReservedAt = goal.pendingAttempt?.reservedAt ?? Date.now();
       attemptGoalID = goal.id;
       attemptID = goal.pendingAttempt?.id;
@@ -3978,7 +3991,9 @@ var server = async ({ client }, options) => {
         return;
       }
       const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures, {
-        expectedGoalID: attemptGoalID
+        expectedGoalID: attemptGoalID,
+        expectedAttemptID: attemptID,
+        expectedAutoTurns: goal.autoTurns
       });
       if (isCurrent() && delivered?.pendingAttempt?.delivered)
         locallyDeliveredPendingSessions.add(sessionID);
@@ -4343,7 +4358,7 @@ var server = async ({ client }, options) => {
                 scheduleSettledContinuation(sessionID, continuationRetryDelayMs(minInterval, attempt.reservedAt), true, "retry");
               }
             } else if (autoContinue) {
-              scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt), false, "recovery");
+              scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, goal), false, "recovery");
             }
           }
         }
@@ -4765,8 +4780,8 @@ async function setupV2(context) {
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
       if (!goal) {
         const waiting = await getGoalInternal(sessionID);
-        if (waiting?.status === "active" && waiting.lastContinuationAt != null && minInterval > 0) {
-          scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, waiting.lastContinuationAt), scheduled != null);
+        if (waiting?.status === "active" && waiting.lastContinuationAt != null && minInterval > 0 && !waiting.shellDeferrals.some((item) => !item.delivered)) {
+          scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, waiting), scheduled != null);
         }
         return;
       }
@@ -4790,7 +4805,9 @@ async function setupV2(context) {
         return;
       }
       const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures, {
-        expectedGoalID: attemptGoalID
+        expectedGoalID: attemptGoalID,
+        expectedAttemptID: attemptID,
+        expectedAutoTurns: goal.autoTurns
       });
       if (isCurrent() && delivered?.pendingAttempt?.delivered)
         locallyDeliveredPendingSessions.add(sessionID);
@@ -5047,7 +5064,7 @@ async function setupV2(context) {
                 scheduleSettledContinuation(sessionID, continuationRetryDelayMs(minInterval, attempt.reservedAt), true, "retry");
               }
             } else if (autoContinue) {
-              scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt), false, "recovery");
+              scheduleSettledContinuation(sessionID, continuationDelayFromSnapshot(minInterval, goal), false, "recovery");
             }
           }
         }

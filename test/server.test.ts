@@ -4,14 +4,17 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { z } from "zod"
 import plugin from "../src/server"
+import { holdNextStateRead } from "./state-read-gate"
 import {
   accountUsage,
   createGoal,
+  deferGoalUntilShell,
   pauseGoalForPlanMode,
   setGoalStatus,
   getGoal,
   getGoalInternal,
   recordContinuationResult,
+  recordToolProgress,
   reserveContinuation,
 } from "../src/state"
 
@@ -42,8 +45,8 @@ function advertisedText(schema: z.ZodType) {
 }
 
 async function waitFor(predicate: () => boolean, deadlineMs = 2000) {
-  const deadline = Date.now() + deadlineMs
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + deadlineMs
+  while (performance.now() < deadline) {
     if (predicate()) return
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
@@ -78,6 +81,99 @@ async function setupServer(...args: Parameters<typeof plugin.server>) {
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-"))
   process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals.json")
+})
+
+test("V1 transport failure cannot consume an attempt reserved after its snapshot", async () => {
+  const hooks = await setupServer({ client: {} } as never, { auto_continue: false, max_prompt_failures: 1 })
+  await createGoal("ses_1", "preserve the newer attempt", null)
+  const first = await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 1, { expectedAttemptID: first?.pendingAttempt?.id })
+  const gate = holdNextStateRead(process.env.OPENCODE_GOAL_STATE_PATH!)
+  const handling = hooks.event!({ event: {
+    type: "session.error", properties: { sessionID: "ses_1", error: { message: "fetch failed" } },
+  } } as never)
+  try {
+    await Promise.race([gate.captured, Bun.sleep(1000).then(() => { throw new Error("state read not intercepted") })])
+    await recordToolProgress("ses_1", "first attempt finished", first?.pendingAttempt?.id)
+    const newer = await reserveContinuation("ses_1", 10, 0)
+    expect(newer?.pendingAttempt?.id).toBeString()
+    gate.release()
+    await handling
+    expect(await getGoalInternal("ses_1")).toMatchObject({
+      status: "active", continuationFailures: 0,
+      pendingAttempt: { id: newer?.pendingAttempt?.id, delivered: false },
+    })
+  } finally {
+    gate.restore()
+    await handling
+  }
+})
+
+test("V1 late prompt success cannot mark a newer attempt delivered", async () => {
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const hooks = await setupServer({ client: { session: { promptAsync: async () => {
+    entered.resolve()
+    await release.promise
+  } } } } as never, { min_continue_interval_seconds: 0 })
+  await createGoal("ses_1", "preserve the newer delivery state", null)
+  const handling = hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  try {
+    await Promise.race([entered.promise, Bun.sleep(1000).then(() => { throw new Error("prompt not entered") })])
+    const first = await getGoalInternal("ses_1")
+    await recordToolProgress("ses_1", "first attempt finished", first?.pendingAttempt?.id)
+    const newer = await reserveContinuation("ses_1", 10, 0)
+    expect(newer?.pendingAttempt?.id).toBeString()
+    release.resolve()
+    await handling
+    expect((await getGoalInternal("ses_1"))?.pendingAttempt).toMatchObject({ id: newer?.pendingAttempt?.id, delivered: false })
+  } finally {
+    release.resolve()
+    await handling
+  }
+})
+
+test("V1 fast execution retains a precise continuation wake-up", async () => {
+  const calls: unknown[] = []
+  const hooks = await setupServer({ client: { session: {
+    promptAsync: async (input: unknown) => { calls.push(input) },
+  } } } as never, { min_continue_interval_seconds: 1 })
+  const clock = spyOn(Date, "now").mockReturnValue(1_700_000_000_900)
+  const timers = spyOn(globalThis, "setTimeout")
+  try {
+    await createGoal("ses_1", "continue after fast progress", null)
+    await reserveContinuation("ses_1", 10, 1)
+    await recordToolProgress("ses_1", "first milestone verified")
+    clock.mockReturnValue(1_700_000_001_100)
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+    expect(calls).toHaveLength(0)
+    // 800 ms remain in the interval, plus the scheduler's 25 ms settle margin.
+    expect(timers.mock.calls.map((call) => call[1])).toContain(825)
+    clock.mockReturnValue(1_700_000_001_900)
+    await waitFor(() => calls.length === 1, 3000)
+    expect(calls).toHaveLength(1)
+    expect((await getGoal("ses_1"))?.autoTurns).toBe(2)
+  } finally {
+    timers.mockRestore()
+    clock.mockRestore()
+    await hooks.dispose?.()
+  }
+})
+
+test("V1 interval wake-up does not poll a goal waiting for a Shell result", async () => {
+  const hooks = await setupServer({ client: {} } as never, { min_continue_interval_seconds: 1 })
+  await createGoal("ses_1", "wait for an existing Shell", null)
+  await reserveContinuation("ses_1", 10, 0)
+  await recordToolProgress("ses_1", "first milestone verified")
+  await deferGoalUntilShell("ses_1", "shell_wait")
+  const timers = spyOn(globalThis, "setTimeout")
+  try {
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+    expect(timers.mock.calls).toHaveLength(0)
+    expect((await getGoal("ses_1"))?.autoTurns).toBe(1)
+  } finally {
+    timers.mockRestore()
+  }
 })
 
 test("V1 goal plan tools persist progress and attach standard ACP plan metadata", async () => {

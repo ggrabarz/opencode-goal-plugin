@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
-import { readFileSync } from "node:fs"
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
+import { z } from "zod"
 import {
   accountUsage,
   cancelGoal,
@@ -47,6 +47,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  setSystemTime()
   delete process.env.OPENCODE_GOAL_STATE_PATH
   await rm(dir, { recursive: true, force: true })
 })
@@ -1243,6 +1244,22 @@ test("a late continuation failure does not clear a newer pending attempt", async
   expect((await getGoal("ses_1"))?.status).toBe("active")
 })
 
+test("accepted delivery cannot recreate tracking after a later turn has already completed", async () => {
+  await createGoal("ses_1", "ignore a late transport success", null)
+  const first = await reserveContinuation("ses_1", 10, 0)
+  await recordToolProgress("ses_1", "first result", first?.pendingAttempt?.id)
+  const second = await reserveContinuation("ses_1", 10, 0)
+  await recordToolProgress("ses_1", "second result", second?.pendingAttempt?.id)
+  const late = await recordContinuationResult("ses_1", "success", 3, {
+    expectedGoalID: first?.id,
+    expectedAttemptID: first?.pendingAttempt?.id,
+    expectedAutoTurns: first?.autoTurns,
+  })
+  expect(late).toBeNull()
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt).toBeNull()
+  expect((await getGoal("ses_1"))?.autoTurns).toBe(2)
+})
+
 test("the minimum continuation interval is measured from the millisecond anchor", async () => {
   // The interval gate compares whole-second timestamps, so a follow-up
   // continuation can slip through as soon as the wall clock crosses into the
@@ -1256,6 +1273,8 @@ test("the minimum continuation interval is measured from the millisecond anchor"
   const first = await reserveContinuation("ses_1", 10, 1)
   expect(first).not.toBeNull()
   expect(first?.lastContinuationAt).toBe(Math.floor((base + 900) / 1000))
+  expect((await getGoalInternal("ses_1"))?.lastContinuationAtMs).toBe(base + 900)
+  expect(await getGoal("ses_1")).not.toHaveProperty("lastContinuationAtMs")
 
   // 200ms later the wall clock is in the next second, but only 200ms of the
   // one second minimum has elapsed.
@@ -1267,6 +1286,30 @@ test("the minimum continuation interval is measured from the millisecond anchor"
   setSystemTime(new Date(base + 1_950))
   const third = await reserveContinuation("ses_1", 10, 1)
   expect(third).not.toBeNull()
+})
+
+test("legacy persisted attempts without millisecond fields still load and roll back", async () => {
+  await createGoal("ses_1", "load a prior-version attempt", null)
+  setSystemTime(new Date(1_700_000_000_900))
+  await reserveContinuation("ses_1", 10, 1)
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const persisted = z.object({
+    goals: z.record(z.string(), z.record(z.string(), z.unknown())),
+  }).passthrough().parse(JSON.parse(await readFile(file, "utf8")))
+  const goal = persisted.goals.ses_1
+  if (!goal) throw new Error("expected persisted goal")
+  const attempt = z.record(z.string(), z.unknown()).parse(goal.pendingAttempt)
+  delete goal.lastContinuationAtMs
+  delete attempt.previousLastContinuationAtMs
+  goal.pendingAttempt = attempt
+  await writeFile(file, JSON.stringify(persisted))
+  const loaded = await getGoalInternal("ses_1")
+  expect(loaded?.lastContinuationAtMs).toBeNull()
+  expect(loaded?.pendingAttempt?.previousLastContinuationAtMs).toBeNull()
+  expect(await getGoal("ses_1")).not.toHaveProperty("lastContinuationAtMs")
+  expect(await rollbackContinuationAttempt("ses_1", { attemptID: loaded?.pendingAttempt?.id })).toBe(true)
+  setSystemTime(new Date(1_700_000_001_100))
+  expect(await reserveContinuation("ses_1", 10, 1)).not.toBeNull()
 })
 
 test("rolling back a continuation restores the minimum interval anchor", async () => {
@@ -1286,5 +1329,20 @@ test("rolling back a continuation restores the minimum interval anchor", async (
   expect((await getGoal("ses_1"))?.autoTurns).toBe(0)
 
   setSystemTime(new Date(base + 1_100))
+  expect(await reserveContinuation("ses_1", 10, 1)).not.toBeNull()
+})
+
+test("rolling back a later continuation restores the previous non-null millisecond anchor", async () => {
+  const base = 1_700_000_000_000
+  await createGoal("ses_1", "retain the previous interval", null)
+  setSystemTime(new Date(base + 900))
+  const first = await reserveContinuation("ses_1", 10, 1)
+  await recordToolProgress("ses_1", "first milestone", first?.pendingAttempt?.id)
+  setSystemTime(new Date(base + 1900))
+  const second = await reserveContinuation("ses_1", 10, 1)
+  expect(await rollbackContinuationAttempt("ses_1", { attemptID: second?.pendingAttempt?.id })).toBe(true)
+  expect((await getGoalInternal("ses_1"))?.lastContinuationAtMs).toBe(base + 900)
+  expect((await getGoal("ses_1"))?.lastContinuationAt).toBe(base / 1000)
+  setSystemTime(new Date(base + 1901))
   expect(await reserveContinuation("ses_1", 10, 1)).not.toBeNull()
 })

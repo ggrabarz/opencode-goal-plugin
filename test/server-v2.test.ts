@@ -1,9 +1,13 @@
-import { afterEach, beforeEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
-import { accountUsage, pauseGoalForPlanMode, setGoalStatus, cancelGoal, completeGoal, createGoal, getGoal, getGoalInternal, recordContinuationResult, reserveContinuation } from "../src/state"
+import { holdNextStateRead } from "./state-read-gate"
+import {
+  accountUsage, pauseGoalForPlanMode, setGoalStatus, cancelGoal, completeGoal, createGoal,
+  getGoal, getGoalInternal, recordContinuationResult, recordToolProgress, reserveContinuation,
+} from "../src/state"
 
 const TOOL_NAMES = [
   "clear_goal",
@@ -203,20 +207,15 @@ function toolContext(sessionID = "ses_v2", agent = "build") {
 }
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, deadlineMs = 3000) {
-  const deadline = Date.now() + deadlineMs
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + deadlineMs
+  while (performance.now() < deadline) {
     if (await predicate()) return
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
   expect(await predicate()).toBe(true)
 }
 
-// The plugin anchors a continuation to a whole-second timestamp, so a
-// configured minimum interval of N seconds may legitimately hold the
-// continuation for up to N + 1 seconds before it reaches the host run
-// boundary. A deadline that only covers N leaves no room for timer drift, and
-// the continuation tests failed intermittently on a loaded machine. The
-// deadline below covers the full window plus scheduling slack.
+// Allow scheduling slack while the host's run-boundary barrier is held.
 const CONTINUATION_BOUNDARY_DEADLINE_MS = 5_000
 
 // Bun's default per-test timeout is 5 seconds. The continuation tests wait
@@ -224,15 +223,6 @@ const CONTINUATION_BOUNDARY_DEADLINE_MS = 5_000
 // legitimate timeline can exceed that default even when every assertion
 // holds. The timeout below covers the waits above without shortening them.
 const CONTINUATION_TEST_TIMEOUT_MS = 30_000
-
-async function waitForLong(predicate: () => boolean | Promise<boolean>, deadlineMs = 3000) {
-  const deadline = Date.now() + deadlineMs
-  while (Date.now() < deadline) {
-    if (await predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 10))
-  }
-  expect(await predicate()).toBe(true)
-}
 
 // A task-block re-arm is a TASK_BLOCK_RETRY_MS timer and nothing else: the V2 poll touches
 // no mock surface, so counting the timers is the only way to tell a stopped loop from a
@@ -1962,6 +1952,90 @@ test("V2 envelope-less session events stay foreign to sibling location instances
   }
 })
 
+test("V2 transport failure cannot consume an attempt reserved after its snapshot", async () => {
+  const mock = makeMockContext({ auto_continue: false, max_prompt_failures: 1 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "preserve the newer attempt")
+  const first = await reserveContinuation("ses_v2", 10, 0)
+  await recordContinuationResult("ses_v2", "success", 1, { expectedAttemptID: first?.pendingAttempt?.id })
+  // execution.failed first reconciles delivered Shell waits in a mutation.
+  // Intercept its following read-only attempt snapshot, outside that queue.
+  const gate = holdNextStateRead(process.env.OPENCODE_GOAL_STATE_PATH!, 1)
+  const handling = mock.stream.push({ type: "session.execution.failed", created: Date.now(), data: {
+    sessionID: "ses_v2", error: { message: "fetch failed" },
+  } })
+  try {
+    await Promise.race([gate.captured, Bun.sleep(1000).then(() => { throw new Error("state read not intercepted") })])
+    await recordToolProgress("ses_v2", "first attempt finished", first?.pendingAttempt?.id)
+    const newer = await reserveContinuation("ses_v2", 10, 0)
+    expect(newer?.pendingAttempt?.id).toBeString()
+    gate.release()
+    await handling
+    expect(await getGoalInternal("ses_v2")).toMatchObject({
+      status: "active", continuationFailures: 0,
+      pendingAttempt: { id: newer?.pendingAttempt?.id, delivered: false },
+    })
+  } finally {
+    gate.restore()
+    await handling
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 late prompt success cannot mark a newer attempt delivered", async () => {
+  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  mock.session.prompt = async () => {
+    entered.resolve()
+    await release.promise
+  }
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "preserve the newer delivery state")
+  const handling = mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  try {
+    await Promise.race([entered.promise, Bun.sleep(1000).then(() => { throw new Error("prompt not entered") })])
+    const first = await getGoalInternal("ses_v2")
+    await recordToolProgress("ses_v2", "first attempt finished", first?.pendingAttempt?.id)
+    const newer = await reserveContinuation("ses_v2", 10, 0)
+    expect(newer?.pendingAttempt?.id).toBeString()
+    release.resolve()
+    await handling
+    expect((await getGoalInternal("ses_v2"))?.pendingAttempt).toMatchObject({ id: newer?.pendingAttempt?.id, delivered: false })
+  } finally {
+    release.resolve()
+    await handling
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 fast execution retains a precise continuation wake-up", async () => {
+  const mock = makeMockContext({ min_continue_interval_seconds: 1 })
+  const cleanup = await setupPlugin(mock as never)
+  const clock = spyOn(Date, "now").mockReturnValue(1_700_000_000_900)
+  const timers = spyOn(globalThis, "setTimeout")
+  try {
+    await createGoalViaV2Tool(mock, "continue after fast progress")
+    await reserveContinuation("ses_v2", 10, 1)
+    await recordToolProgress("ses_v2", "first milestone verified")
+    clock.mockReturnValue(1_700_000_001_100)
+    await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    expect(mock.promptCalls).toHaveLength(0)
+    expect(timers.mock.calls.map((call) => call[1])).toContain(825)
+    clock.mockReturnValue(1_700_000_001_900)
+    await waitFor(() => mock.promptCalls.length === 1, 3000)
+    expect(mock.promptCalls).toHaveLength(1)
+    expect((await getGoal("ses_v2"))?.autoTurns).toBe(2)
+  } finally {
+    timers.mockRestore()
+    clock.mockRestore()
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
 test("V2 fast execution success schedules the next continuation after the minimum interval", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 1 })
   const cleanup = await setupPlugin(mock as never)
@@ -1979,12 +2053,12 @@ test("V2 fast execution success schedules the next continuation after the minimu
   const idleBarrier = new Promise<void>((resolve) => { releaseWait = resolve })
   mock.session.wait = async () => { waiting = true; await idleBarrier }
   await mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
-  await waitForLong(() => waiting, CONTINUATION_BOUNDARY_DEADLINE_MS)
+  await waitFor(() => waiting, CONTINUATION_BOUNDARY_DEADLINE_MS)
   expect(mock.promptCalls).toHaveLength(1)
   await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
   releaseWait()
   mock.session.wait = async () => {}
-  await waitForLong(() => mock.promptCalls.length === 2, CONTINUATION_BOUNDARY_DEADLINE_MS)
+  await waitFor(() => mock.promptCalls.length === 2, CONTINUATION_BOUNDARY_DEADLINE_MS)
   expect((await getGoal("ses_v2"))!.lastContinuationAt! - first).toBeGreaterThanOrEqual(1)
   mock.stream.end()
   await cleanup()
@@ -2036,10 +2110,10 @@ test("V2 timed continuation waits for a live run boundary even when busy events 
   mock.session.wait = async () => { waiting = true; await idleBarrier }
   // No busy event is delivered for the next execution; only the host's live
   // wait barrier knows that another assistant step is still running.
-  await waitForLong(() => waiting, CONTINUATION_BOUNDARY_DEADLINE_MS)
+  await waitFor(() => waiting, CONTINUATION_BOUNDARY_DEADLINE_MS)
   expect(mock.promptCalls).toHaveLength(1)
   releaseWait()
-  await waitForLong(() => mock.promptCalls.length === 2, CONTINUATION_BOUNDARY_DEADLINE_MS)
+  await waitFor(() => mock.promptCalls.length === 2, CONTINUATION_BOUNDARY_DEADLINE_MS)
   mock.stream.end()
   await cleanup()
 }, CONTINUATION_TEST_TIMEOUT_MS)

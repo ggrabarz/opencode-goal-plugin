@@ -371,6 +371,7 @@ export type GoalSnapshot = Omit<
 export type InternalGoalSnapshot = GoalSnapshot & {
   pendingAttempt: PendingAttempt | null
   shellDeferrals: ShellDeferral[]
+  lastContinuationAtMs: number | null
 }
 
 export type GoalListItem = Pick<
@@ -862,7 +863,10 @@ export function snapshot(goal: Goal): GoalSnapshot {
 }
 
 export function snapshotInternal(goal: Goal): InternalGoalSnapshot {
-  return { ...snapshot(goal), pendingAttempt: goal.pendingAttempt, shellDeferrals: goal.shellDeferrals }
+  return {
+    ...snapshot(goal), pendingAttempt: goal.pendingAttempt,
+    shellDeferrals: goal.shellDeferrals, lastContinuationAtMs: goal.lastContinuationAtMs,
+  }
 }
 
 export async function getGoal(sessionID: string) {
@@ -1636,13 +1640,19 @@ export async function recordContinuationResult(
     requirePending?: boolean
     expectedGoalID?: string
     expectedAttemptID?: string
+    expectedAutoTurns?: number
   },
 ) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal || isClosed(goal.status)) return goal ? snapshotInternal(goal) : null
     if (options?.expectedGoalID && goal.id !== options.expectedGoalID) return null
-    if (options?.expectedAttemptID && goal.pendingAttempt?.id !== options.expectedAttemptID) return null
+    if (options?.expectedAutoTurns != null && goal.autoTurns !== options.expectedAutoTurns) return null
+    if (options?.expectedAttemptID && goal.pendingAttempt?.id !== options.expectedAttemptID) {
+      // Progress may consume a reservation before its accepted send resolves.
+      // Recreate delivery tracking only if no later turn has been reserved.
+      if (result !== "success" || goal.pendingAttempt != null || options.expectedAutoTurns == null) return null
+    }
     const now = nowSeconds()
     goal.updatedAt = now
     if (result === "success") {
