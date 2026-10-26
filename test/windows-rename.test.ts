@@ -54,7 +54,8 @@ test.skipIf(process.platform !== "win32")("native Windows lock survives beyond t
           try {
             await defaultAtomicWriteOps.rename(from, to)
           } catch (error) {
-            expect(error).toMatchObject({ code: expect.stringMatching(/^(EPERM|EACCES|EBUSY)$/) })
+            const code = error instanceof Error && "code" in error ? error.code : undefined
+            expect(code).toMatch(/^(EPERM|EACCES|EBUSY)$/)
             failures++
             if (failures === 4) {
               expect(await readFile(file, "utf8")).toBe(oldState)
