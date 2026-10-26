@@ -175,17 +175,7 @@ export const defaultAtomicWriteOps: AtomicWriteOps = {
   sleep: defaultSleep,
 }
 
-/**
- * Total rename attempts for transient Windows replacement errors.
- *
- * The budget has to cover how long Windows actually holds the target. A
- * rename-over-existing fails with `EPERM`/`EACCES` while an antivirus
- * scanner, a search indexer, or another process keeps the file open, and
- * those locks routinely outlive a couple of hundred milliseconds. The old
- * three-attempt budget (60ms of waiting in total) gave up while the lock
- * was still held and surfaced `EPERM` to the caller, which turned a
- * transient Windows file lock into a failed goal state write.
- */
+/** Total rename attempts for transient Windows replacement errors. */
 export const RENAME_ATTEMPTS = 10
 
 /** Base backoff between rename retries (doubled per attempt). */
@@ -197,11 +187,9 @@ export const RENAME_RETRY_MAX_DELAY_MS = 500
 /**
  * Backoff before the next rename attempt.
  *
- * Exponential so a briefly-locked target is retried quickly, capped so a
- * target that stays locked cannot block the caller indefinitely. The full
- * budget (10 attempts) waits roughly 2.6 seconds in the worst case, which
- * covers the multi-second locks observed on Windows hosts while keeping
- * the common (uncontended) path at a single rename.
+ * Nine waits total 2620ms, extending the previous 60ms retry window.
+ * Filesystem operations take additional time; this bounds backoff, not I/O.
+ * An uncontended write still performs a single rename without waiting.
  */
 export function renameRetryDelayMs(attempt: number) {
   const exponential = RENAME_RETRY_DELAY_MS * 2 ** Math.max(0, attempt - 1)
