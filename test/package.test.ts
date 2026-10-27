@@ -105,3 +105,17 @@ test("engines.opencode covers the V2 beta line and the V1 floor while excluding 
     expect(satisfies(version, range)).toBe(false)
   }
 })
+
+test("engines.node requires unflagged built-in SQLite", () => {
+  const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
+    engines?: Record<string, string>
+  }
+  const range = packageJson.engines?.node
+  if (typeof range !== "string") throw new Error("expected engines.node to be a string range")
+  for (const version of ["22.13.0", "22.14.0", "23.4.0", "24.0.0"]) {
+    expect(satisfies(version, range)).toBe(true)
+  }
+  for (const version of ["20.0.0", "22.12.0", "23.0.0", "23.3.0"]) {
+    expect(satisfies(version, range)).toBe(false)
+  }
+})

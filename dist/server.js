@@ -3757,13 +3757,13 @@ function isClosedGoal(goal) {
   return goal.status === "complete" || goal.status === "unmet" || goal.status === "cancelled";
 }
 async function stopGoalFromTool(context, services) {
-  const goal = await cancelGoal(context.sessionID);
   services.stopAutonomy?.(context.sessionID);
+  const goal = await cancelGoal(context.sessionID);
   return JSON.stringify({ goal, cancelled: goal?.status === "cancelled" }, null, 2);
 }
 async function clearGoalFromTool(context, services) {
-  const cleared = await clearGoal(context.sessionID);
   services.stopAutonomy?.(context.sessionID);
+  const cleared = await clearGoal(context.sessionID);
   return JSON.stringify({ goal: null, cleared }, null, 2);
 }
 async function replaceGoalFromTool(input, context, services) {
@@ -3812,7 +3812,10 @@ async function updateGoalObjectiveFromTool(input, context, services) {
   const requested = input.status ?? "active";
   const planningOnly = requested === "active" && services.isPlanAgent(context.agent);
   const edit = services.consumeObjectiveEdit?.(context.sessionID, input.objective);
-  const goal = await updateGoalObjective(context.sessionID, edit?.objective ?? input.objective, planningOnly ? "paused" : requested, {
+  const objective = validateObjective(edit?.objective ?? input.objective, services.maxObjectiveChars);
+  if (requested === "paused")
+    services.stopAutonomy?.(context.sessionID);
+  const goal = await updateGoalObjective(context.sessionID, objective, planningOnly ? "paused" : requested, {
     agent: typeof context.agent === "string" ? context.agent : null,
     planModePause: planningOnly,
     maxObjectiveChars: services.maxObjectiveChars,
@@ -3842,6 +3845,8 @@ async function updateGoalStatusFromTool(input, context, services) {
   if (input.blocker && input.reason !== "awaiting_user") {
     throw new Error("blocker is only valid for an awaiting_user pause");
   }
+  if (input.status === "paused")
+    services.stopAutonomy?.(context.sessionID);
   const goal = await setGoalStatus(context.sessionID, input.status, typeof context.agent === "string" ? context.agent : null, {
     resetAutoTurnLimit: explicitResume,
     allowInterruptedResume: explicitResume,
@@ -4484,11 +4489,10 @@ var server = async ({ client }, options) => {
         explicitResumeRequests.add(input.sessionID);
       if (input.command !== "pause_goal")
         return;
+      goalServices.stopAutonomy?.(input.sessionID);
       const goal = await getGoal(input.sessionID);
       if (goal?.status === "active")
         await setGoalStatus(input.sessionID, "paused");
-      cancelScheduledContinuation(input.sessionID);
-      clearTurnWatchdog(input.sessionID);
     },
     async "tool.execute.after"(input, output) {
       taskTracker.noteTaskOutput(input, output);
@@ -5293,12 +5297,6 @@ async function setupV2(context) {
       }
       case "session.execution.succeeded":
       case "session.idle": {
-        if (sessionID && event.type === "session.execution.succeeded") {
-          const goal = await getGoalInternal(sessionID);
-          if (goal?.shellDeferrals.some((item) => item.delivered)) {
-            await releaseDeliveredShellDeferrals(sessionID);
-          }
-        }
         if (sessionID) {
           explicitResumeRequests.delete(sessionID);
           busySessions.delete(sessionID);
@@ -5306,6 +5304,12 @@ async function setupV2(context) {
           clearTurnWatchdog(sessionID);
           watchdogRescuedSessions.delete(sessionID);
           taskTracker.observeSessionStatus(sessionID, "idle");
+        }
+        if (sessionID && event.type === "session.execution.succeeded") {
+          const goal = await getGoalInternal(sessionID);
+          if (goal?.shellDeferrals.some((item) => item.delivered)) {
+            await releaseDeliveredShellDeferrals(sessionID);
+          }
         }
         if (sessionID) {
           const goal = await getGoalInternal(sessionID);
@@ -5548,11 +5552,10 @@ async function setupV2(context) {
               objectiveEdits.set(input.sessionID, { goalID: editedGoal.id, objective: edit[1].trim() });
             markSessionOwnership(input.sessionID, true);
             if (command.action === "pause") {
+              goalServices.stopAutonomy?.(input.sessionID);
               const goal = await getGoal(input.sessionID);
               if (goal?.status === "active")
                 await setGoalStatus(input.sessionID, "paused");
-              cancelScheduledContinuation(input.sessionID);
-              clearTurnWatchdog(input.sessionID);
             }
             if (command.action === "resume" || command.action === "goal" && input.prompt.text.trim().toLowerCase() === "resume") {
               explicitResumeRequests.add(input.sessionID);
@@ -5641,11 +5644,10 @@ async function setupV2(context) {
         delete input.prompt.agents;
         delete input.prompt.skills;
         if (template === pauseTemplate) {
+          goalServices.stopAutonomy?.(input.sessionID);
           const goal = await getGoal(input.sessionID);
           if (goal?.status === "active")
             await setGoalStatus(input.sessionID, "paused");
-          cancelScheduledContinuation(input.sessionID);
-          clearTurnWatchdog(input.sessionID);
         }
       }
       if (isExplicitResumePrompt(input.prompt.text, commandName, locale, messages)) {
@@ -5713,7 +5715,7 @@ async function setupV2(context) {
       return;
     if (toolOutputFailed(input.result))
       return;
-    const recovering = Boolean(text2?.trim()) && expectedAttemptID == null && scheduledContinuations.get(sessionID)?.purpose === "recovery";
+    const recovering = Boolean(text2?.trim()) && expectedAttemptID == null && !activeContinuationsV2.has(sessionID) && scheduledContinuations.get(sessionID)?.purpose === "recovery";
     if (recovering)
       cancelScheduledContinuation(sessionID);
     const before = await getGoalInternal(sessionID);

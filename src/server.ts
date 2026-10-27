@@ -1316,14 +1316,14 @@ function isClosedGoal(goal: Pick<GoalSnapshot, "status">) {
 }
 
 async function stopGoalFromTool(context: ToolExecContext, services: GoalServices) {
-  const goal = await cancelGoal(context.sessionID)
   services.stopAutonomy?.(context.sessionID)
+  const goal = await cancelGoal(context.sessionID)
   return JSON.stringify({ goal, cancelled: goal?.status === "cancelled" }, null, 2)
 }
 
 async function clearGoalFromTool(context: ToolExecContext, services: GoalServices) {
-  const cleared = await clearGoal(context.sessionID)
   services.stopAutonomy?.(context.sessionID)
+  const cleared = await clearGoal(context.sessionID)
   return JSON.stringify({ goal: null, cleared }, null, 2)
 }
 
@@ -1407,7 +1407,9 @@ async function updateGoalObjectiveFromTool(
   const requested = input.status ?? "active"
   const planningOnly = requested === "active" && services.isPlanAgent(context.agent)
   const edit = services.consumeObjectiveEdit?.(context.sessionID, input.objective)
-  const goal = await updateGoalObjective(context.sessionID, edit?.objective ?? input.objective, planningOnly ? "paused" : requested, {
+  const objective = validateObjective(edit?.objective ?? input.objective, services.maxObjectiveChars)
+  if (requested === "paused") services.stopAutonomy?.(context.sessionID)
+  const goal = await updateGoalObjective(context.sessionID, objective, planningOnly ? "paused" : requested, {
     agent: typeof context.agent === "string" ? context.agent : null,
     planModePause: planningOnly,
     maxObjectiveChars: services.maxObjectiveChars,
@@ -1454,6 +1456,7 @@ async function updateGoalStatusFromTool(
   if (input.blocker && input.reason !== "awaiting_user") {
     throw new Error("blocker is only valid for an awaiting_user pause")
   }
+  if (input.status === "paused") services.stopAutonomy?.(context.sessionID)
   const goal = await setGoalStatus(
     context.sessionID,
     input.status,
@@ -2223,10 +2226,9 @@ const server: Plugin = async ({ client }, options?: Options) => {
       if (!sanitizeGoalStatusCommandParts(output, template)) return
       if (input.command === "resume_goal") explicitResumeRequests.add(input.sessionID)
       if (input.command !== "pause_goal") return
+      goalServices.stopAutonomy?.(input.sessionID)
       const goal = await getGoal(input.sessionID)
       if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
-      cancelScheduledContinuation(input.sessionID)
-      clearTurnWatchdog(input.sessionID)
     },
     async "tool.execute.after"(input, output) {
       taskTracker.noteTaskOutput(
@@ -3148,12 +3150,6 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       // individual step completions may still be followed by tool/model work.
       case "session.execution.succeeded":
       case "session.idle": {
-        if (sessionID && event.type === "session.execution.succeeded") {
-          const goal = await getGoalInternal(sessionID)
-          if (goal?.shellDeferrals.some((item) => item.delivered)) {
-            await releaseDeliveredShellDeferrals(sessionID)
-          }
-        }
         if (sessionID) {
           explicitResumeRequests.delete(sessionID)
           busySessions.delete(sessionID)
@@ -3161,6 +3157,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           clearTurnWatchdog(sessionID)
           watchdogRescuedSessions.delete(sessionID)
           taskTracker.observeSessionStatus(sessionID, "idle")
+        }
+        if (sessionID && event.type === "session.execution.succeeded") {
+          const goal = await getGoalInternal(sessionID)
+          if (goal?.shellDeferrals.some((item) => item.delivered)) {
+            await releaseDeliveredShellDeferrals(sessionID)
+          }
         }
         if (sessionID) {
           // Resolution of a pending attempt runs even when auto-continue is
@@ -3407,10 +3409,9 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
               if (editedGoal && edit) objectiveEdits.set(input.sessionID, { goalID: editedGoal.id, objective: edit[1]!.trim() })
               markSessionOwnership(input.sessionID, true)
               if (command.action === "pause") {
+                goalServices.stopAutonomy?.(input.sessionID)
                 const goal = await getGoal(input.sessionID)
                 if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
-                cancelScheduledContinuation(input.sessionID)
-                clearTurnWatchdog(input.sessionID)
               }
               if (
                 command.action === "resume" ||
@@ -3521,10 +3522,9 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           delete input.prompt.agents
           delete input.prompt.skills
           if (template === pauseTemplate) {
+            goalServices.stopAutonomy?.(input.sessionID)
             const goal = await getGoal(input.sessionID)
             if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
-            cancelScheduledContinuation(input.sessionID)
-            clearTurnWatchdog(input.sessionID)
           }
         }
         if (isExplicitResumePrompt(input.prompt.text, commandName, locale, messages)) {
@@ -3604,7 +3604,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (!tracksToolStarts || !sessionID || typeof input.tool !== "string") return
       if (NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
       if (toolOutputFailed(input.result)) return
-      const recovering = Boolean(text?.trim()) && expectedAttemptID == null && scheduledContinuations.get(sessionID)?.purpose === "recovery"
+      const recovering = Boolean(text?.trim()) && expectedAttemptID == null &&
+        !activeContinuationsV2.has(sessionID) && scheduledContinuations.get(sessionID)?.purpose === "recovery"
       if (recovering) cancelScheduledContinuation(sessionID)
       const before = await getGoalInternal(sessionID)
       if (!before || before.status !== "active" ||

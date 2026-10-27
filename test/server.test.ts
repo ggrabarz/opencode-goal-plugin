@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { z } from "zod"
 import plugin from "../src/server"
 import { holdNextStateRead } from "./state-read-gate"
+import { withStateLock } from "../src/state-lock"
 import {
   accountUsage,
   createGoal,
@@ -4471,3 +4472,51 @@ test("V1 only a sanitized explicit goal edit authorizes clearing a saved plan", 
   await requireTool(hooks.tool?.update_goal_objective,"update_goal_objective").execute({objective:"New user scope &amp; &lt;checks&gt;"},context)
   expect(await getGoal("ses_edit")).toMatchObject({objective:"New user scope & <checks>",plan:null,planRevision:2})
 })
+
+for (const control of ["stop_goal", "clear_goal", "pause_tool", "pause_objective", "pause_command"]) {
+  test(`V1 ${control} suppresses the watchdog while ownership is held`, async () => {
+    const calls: unknown[] = []
+    const hooks = await setupServer(
+      { client: { session: { promptAsync: async (input: unknown) => { calls.push(input) } } } } as never,
+      { auto_continue: false, max_turn_time: 0.5 },
+    )
+    const context = { sessionID: "ses_control", agent: "build" } as never
+    await requireTool(hooks.tool?.create_goal, "create_goal").execute({ objective: "stop before persistence is available" }, context)
+    const config: { command?: Record<string, { template: string }> } = {}
+    await hooks.config?.(config as never)
+    await hooks.event!({ event: { type: "session.status", properties: { sessionID: "ses_control", status: { type: "busy" } } } as never })
+    const held = Promise.withResolvers<void>()
+    const released = Promise.withResolvers<void>()
+    const owner = withStateLock(process.env.OPENCODE_GOAL_STATE_PATH!, async () => {
+      held.resolve()
+      await released.promise
+    })
+    let stopping: void | Promise<unknown> = undefined
+    try {
+      await held.promise
+      stopping = control === "pause_command"
+        ? hooks["command.execute.before"]?.(
+          { command: "pause_goal", sessionID: "ses_control", arguments: "" },
+          { parts: [{ type: "text", text: config.command?.pause_goal?.template }] } as never,
+        )
+        : requireTool(hooks.tool?.[control === "pause_tool" ? "update_goal_status" : control === "pause_objective" ? "update_goal_objective" : control], control).execute(
+          control === "pause_objective" ? { objective: "paused objective", status: "paused" } : control === "pause_tool" ? { status: "paused" } : {}, context,
+        )
+      await Bun.sleep(800)
+      const promptsWhileHeld = calls.length
+      released.resolve()
+      await owner
+      await stopping
+      expect(promptsWhileHeld).toBe(0)
+      expect(calls).toHaveLength(0)
+      expect((await getGoal("ses_control"))?.status ?? null).toBe(
+        control === "stop_goal" ? "cancelled" : control === "clear_goal" ? null : "paused",
+      )
+    } finally {
+      released.resolve()
+      await owner
+      await stopping
+      await hooks.dispose?.()
+    }
+  }, 10_000)
+}
