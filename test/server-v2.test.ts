@@ -3,6 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
+import { withStateLock } from "../src/state-lock"
 import { holdNextStateRead } from "./state-read-gate"
 import {
   accountUsage, pauseGoalForPlanMode, setGoalStatus, cancelGoal, completeGoal, createGoal,
@@ -3523,6 +3524,123 @@ test("V2 wait_for_command overrides the client default in both directions", asyn
       delivery: "steer",
     })
     expect(waits).toBe(expectedWaits)
+    await cleanup()
+  }
+})
+
+for (const settlement of ["interrupted", "failed"]) {
+  test(`V2 ${settlement} cancels its watchdog before waiting for state ownership`, async () => {
+    const mock = makeMockContext({ max_turn_time: 0.5, min_continue_interval_seconds: 0 })
+    const cleanup = await setupPlugin(mock as never)
+    await createGoalViaV2Tool(mock, "settle before slow persistence")
+    const held = Promise.withResolvers<void>()
+    const released = Promise.withResolvers<void>()
+    const owner = withStateLock(process.env.OPENCODE_GOAL_STATE_PATH!, async () => {
+      held.resolve()
+      await released.promise
+    })
+    let settling: Promise<void> | undefined
+    try {
+      await held.promise
+      await mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
+      settling = mock.stream.push(settlement === "interrupted"
+        ? { type: "session.execution.interrupted", created: 2, data: { sessionID: "ses_v2", reason: "shutdown" } }
+        : { type: "session.execution.failed", created: 2, data: { sessionID: "ses_v2", error: { message: "invalid provider configuration" } } })
+      await Bun.sleep(800)
+      const promptsWhileHeld = mock.promptCalls.length
+      released.resolve()
+      await owner
+      await settling
+      if (promptsWhileHeld) await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.delivered === true)
+      expect(promptsWhileHeld).toBe(0)
+      expect(mock.promptCalls).toHaveLength(0)
+    } finally {
+      released.resolve()
+      await owner
+      await settling
+      mock.stream.end()
+      await cleanup()
+    }
+  }, 10_000)
+}
+
+test("V2 arms the watchdog after a blocked goal creation commits", async () => {
+  const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.03 })
+  const cleanup = await setupPlugin(mock as never)
+  const held = Promise.withResolvers<void>()
+  const released = Promise.withResolvers<void>()
+  const owner = withStateLock(process.env.OPENCODE_GOAL_STATE_PATH!, async () => {
+    held.resolve()
+    await released.promise
+  })
+  let creating: Promise<unknown> | undefined
+  try {
+    await held.promise
+    await mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
+    creating = createGoalViaV2Tool(mock, "rescue after ownership becomes available")
+    await Bun.sleep(100)
+    expect(mock.promptCalls).toHaveLength(0)
+    released.resolve()
+    await owner
+    await creating
+    await waitFor(() => mock.promptCalls.length === 1)
+    await Bun.sleep(100)
+    expect(mock.promptCalls).toHaveLength(1)
+  } finally {
+    released.resolve()
+    await owner
+    await creating
+    mock.stream.end()
+    await cleanup()
+  }
+}, 10_000)
+
+test("V2 does not arm a watchdog while a busy event is still reading state", async () => {
+  const mock = makeMockContext({ max_turn_time: 0.03, min_continue_interval_seconds: 0 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "allow the queued interruption to settle")
+  const gate = holdNextStateRead(process.env.OPENCODE_GOAL_STATE_PATH!)
+  const started = mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
+  const interrupted = mock.stream.push({ type: "session.execution.interrupted", created: 2, data: { sessionID: "ses_v2", reason: "shutdown" } })
+  try {
+    await gate.captured
+    await Bun.sleep(150)
+    const promptsBeforeRead = mock.promptCalls.length
+    gate.release()
+    await started
+    await interrupted
+    expect(promptsBeforeRead).toBe(0)
+    expect(mock.promptCalls).toHaveLength(0)
+  } finally {
+    gate.restore()
+    await started
+    await interrupted
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 meaningful tool progress cancels recovery before its state read finishes", async () => {
+  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "resume through native tool progress")
+  await mock.stream.push({ type: "session.execution.failed", created: 1, data: { sessionID: "ses_v2", error: { message: "network connection failed" } } })
+  const gate = holdNextStateRead(process.env.OPENCODE_GOAL_STATE_PATH!)
+  const progressing = mock.hooks["execute.after"]!({
+    tool: "bash", sessionID: "ses_v2", id: "call_progress", status: "completed", result: { output: "tests passed" },
+  })
+  try {
+    await gate.captured
+    await Bun.sleep(150)
+    const promptsBeforeRead = mock.promptCalls.length
+    gate.release()
+    await progressing
+    expect(promptsBeforeRead).toBe(0)
+    expect(mock.promptCalls).toHaveLength(0)
+  } finally {
+    gate.restore()
+    await progressing
+    mock.stream.end()
     await cleanup()
   }
 })

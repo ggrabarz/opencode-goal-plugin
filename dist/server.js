@@ -292,8 +292,8 @@ function goalPlanEntries(plan) {
 
 // src/state.ts
 import { randomUUID as randomUUID2 } from "crypto";
-import { mkdir } from "fs/promises";
-import { dirname as dirname3 } from "path";
+import { mkdir as mkdir2 } from "fs/promises";
+import { dirname as dirname4 } from "path";
 import { Data, Effect, Schema } from "effect-goal-state";
 
 // src/atomic-write.ts
@@ -304,7 +304,7 @@ function isUnsupportedSyncDirError(error, platform) {
   const code = error?.code;
   return code === "EINVAL" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "EISDIR" || platform === "win32" && (code === "EPERM" || code === "EACCES" || code === "EBADF");
 }
-function isTransientRenameError(error, platform) {
+function isTransientWindowsFileError(error, platform) {
   if (platform !== "win32")
     return false;
   const code = error?.code;
@@ -318,7 +318,7 @@ async function openWithRetry(ops, path, flags, mode) {
       return await ops.open(path, flags, mode);
     } catch (error) {
       attempt += 1;
-      if (!isTransientRenameError(error, ops.platform) || attempt >= OPEN_ATTEMPTS)
+      if (!isTransientWindowsFileError(error, ops.platform) || attempt >= OPEN_ATTEMPTS)
         throw error;
       await ops.sleep(renameRetryDelayMs(attempt));
     }
@@ -385,7 +385,7 @@ async function renameWithRetry(ops, from, to) {
       return;
     } catch (error) {
       attempt += 1;
-      if (!isTransientRenameError(error, ops.platform) || attempt >= RENAME_ATTEMPTS)
+      if (!isTransientWindowsFileError(error, ops.platform) || attempt >= RENAME_ATTEMPTS)
         throw error;
       await ops.sleep(renameRetryDelayMs(attempt));
     }
@@ -516,52 +516,84 @@ function reportPluginError(message, error) {
 }
 
 // src/state-lock.ts
-import { open as open2, stat, unlink as unlink2 } from "fs/promises";
-var LOCK_STALE_MS = 30000;
-var LOCK_TIMEOUT_MS = 5000;
-var LOCK_RETRY_MS = 20;
-function stateLockPath(stateFile) {
-  return `${stateFile}.lock`;
-}
-async function acquireStateLock(lockPath, options = {}) {
-  const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
-  const staleMs = options.staleMs ?? LOCK_STALE_MS;
-  const deadline = Date.now() + timeoutMs;
-  for (;; ) {
-    try {
-      const handle = await open2(lockPath, "wx");
-      try {
-        await handle.close();
-      } catch {}
-      return {
-        held: true,
-        release: async () => {
-          try {
-            await unlink2(lockPath);
-          } catch {}
-        }
-      };
-    } catch (error) {
-      const code = error?.code;
-      const contended = code === "EEXIST" || code === "EPERM" || code === "EACCES";
-      if (!contended) {
-        reportPluginError(`Could not create the state lock at ${lockPath}`, error instanceof Error ? error : new Error(String(code ?? "unknown error")));
-        return { held: false, release: async () => {} };
-      }
-      try {
-        const stats = await stat(lockPath);
-        if (Date.now() - stats.mtimeMs > staleMs) {
-          await unlink2(lockPath);
-          continue;
-        }
-      } catch {}
-      if (Date.now() >= deadline) {
-        reportPluginError(`Gave up waiting for the state lock at ${lockPath}`);
-        return { held: false, release: async () => {} };
-      }
-      await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
-    }
+import { chmod as chmod2, lstat, mkdir, realpath } from "fs/promises";
+import { basename, dirname as dirname3, join as join3, resolve } from "path";
+import { setTimeout as sleep } from "timers/promises";
+async function openConnection(file) {
+  const specifier = process.versions.bun ? "bun:sqlite" : "node:sqlite";
+  if (process.versions.bun) {
+    const sqlite2 = await import(specifier);
+    return new sqlite2.Database(file);
   }
+  const sqlite = await import(specifier);
+  return new sqlite.DatabaseSync(file);
+}
+function isBusy(error) {
+  if (typeof error !== "object" || error === null)
+    return false;
+  const code = "errcode" in error ? error.errcode : ("errno" in error) ? error.errno : undefined;
+  return typeof code === "number" && (code & 255) === 5;
+}
+async function validateCoordinator(file) {
+  try {
+    if (!(await lstat(file)).isFile())
+      throw new Error(`State coordinator must be a regular file: ${file}`);
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")
+      return;
+    throw error;
+  }
+}
+function closeConnection(connection, acquired) {
+  let failure;
+  try {
+    if (acquired)
+      connection.exec("ROLLBACK");
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    connection.close();
+  } catch (error) {
+    failure ??= error;
+  }
+  return failure;
+}
+async function withStateLock(stateFile, action) {
+  const file = resolve(stateFile);
+  await mkdir(dirname3(file), { recursive: true, mode: 448 });
+  const coordinator = join3(await realpath(dirname3(file)), `${basename(file)}.coord.sqlite`);
+  await validateCoordinator(coordinator);
+  const connection = await openConnection(coordinator);
+  let acquired = false;
+  let result;
+  try {
+    await validateCoordinator(coordinator);
+    await chmod2(coordinator, 384);
+    connection.exec("PRAGMA busy_timeout = 0");
+    const deadline = performance.now() + 1e4;
+    for (;; ) {
+      try {
+        connection.exec("BEGIN IMMEDIATE");
+        acquired = true;
+        break;
+      } catch (error) {
+        if (!isBusy(error))
+          throw error;
+        if (performance.now() >= deadline)
+          throw new Error(`Timed out waiting for goal state ownership: ${stateFile}`, { cause: error });
+        await sleep(20);
+      }
+    }
+    result = await action();
+  } catch (error) {
+    closeConnection(connection, acquired);
+    throw error;
+  }
+  const failure = closeConnection(connection, acquired);
+  if (failure !== undefined)
+    throw failure;
+  return result;
 }
 
 // src/state-read.ts
@@ -573,7 +605,7 @@ var MISSING_READ_RETRY_DELAY_MS = 2;
 var defaultStateReadOps = {
   platform: process.platform,
   readFile: (path) => readFile(path, "utf8"),
-  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  sleep: (ms) => new Promise((resolve2) => setTimeout(resolve2, ms))
 };
 function isTransientReadError(error, platform) {
   const code = error?.code;
@@ -816,13 +848,7 @@ function readStateResultEffect(file = statePath()) {
   }).pipe(Effect.flatMap((raw) => Effect.try({
     try: () => parseStateText(raw, file),
     catch: (cause) => new StateDecodeError({ cause })
-  }).pipe(Effect.flatMap(({ value, recoveryContent }) => decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent, raw })))))), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed({ state: emptyState(), recoveryContent: null, raw: null }) : Effect.fail(error)));
-}
-function readRawStateEffect(file = statePath()) {
-  return Effect.tryPromise({
-    try: () => readStateFile(file),
-    catch: (cause) => new StateReadError({ cause })
-  }).pipe(Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed(null) : Effect.fail(error)));
+  }).pipe(Effect.flatMap(({ value, recoveryContent }) => decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent })))))), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed({ state: emptyState(), recoveryContent: null }) : Effect.fail(error)));
 }
 function readStateEffect(file = statePath()) {
   return readStateResultEffect(file).pipe(Effect.map(({ state }) => state));
@@ -831,7 +857,7 @@ function quarantineStateEffect(file, content) {
   return Effect.promise(async () => {
     const quarantineFile = `${file}.corrupt-${Date.now()}-${randomUUID2()}`;
     try {
-      await mkdir(dirname3(file), { recursive: true, mode: 448 });
+      await mkdir2(dirname4(file), { recursive: true, mode: 448 });
       await atomicWriteFile(quarantineFile, content);
       return { quarantineFile, error: null };
     } catch (error) {
@@ -839,25 +865,24 @@ function quarantineStateEffect(file, content) {
     }
   });
 }
-function verifyRecoverySourceEffect(file, expectedContent, quarantineFile) {
-  return Effect.promise(async () => {
-    try {
-      return await readStateFile(file) === expectedContent;
-    } catch (error) {
-      if (!isMissingStateFile(error)) {
-        try {
-          console.error(`[opencode-goal-plugin] Could not re-read ${file} after preserving it at ${quarantineFile}; continuing recovery:`, error instanceof Error ? error.message : String(error));
-        } catch {}
-        reportPluginError(`Could not re-read ${file} after preserving it at ${quarantineFile}`, error);
+function verifyRecoverySourceEffect(file, expectedContent) {
+  return Effect.tryPromise({
+    try: async () => {
+      try {
+        return await readStateFile(file) === expectedContent;
+      } catch (error) {
+        if (isMissingStateFile(error))
+          return true;
+        throw error;
       }
-      return true;
-    }
+    },
+    catch: (cause) => new StateReadError({ cause })
   });
 }
 function writeStateEffect(state, file = statePath()) {
   return Effect.tryPromise({
     try: async () => {
-      await mkdir(dirname3(file), { recursive: true, mode: 448 });
+      await mkdir2(dirname4(file), { recursive: true, mode: 448 });
       await atomicWriteFile(file, JSON.stringify(state, null, 2) + `
 `);
     },
@@ -868,7 +893,6 @@ async function readState() {
   return Effect.runPromise(readStateEffect());
 }
 var mutationQueue = Promise.resolve();
-var MAX_MUTATION_ATTEMPTS = 8;
 function enqueueMutation(operation) {
   const current = mutationQueue.then(operation, operation);
   mutationQueue = current.then(() => {
@@ -881,69 +905,52 @@ function enqueueMutation(operation) {
 async function mutate(fn, shouldWrite = () => true) {
   return enqueueMutation(async () => {
     const file = statePath();
-    const lock = await acquireStateLock(stateLockPath(file));
-    try {
-      return await Effect.runPromise(Effect.gen(function* () {
-        let lastState = null;
-        let lastResult;
-        for (let attempt = 0;attempt < MAX_MUTATION_ATTEMPTS; attempt++) {
-          const { state, recoveryContent, raw } = yield* readStateResultEffect(file);
-          const result = yield* Effect.tryPromise({
-            try: () => Promise.resolve(fn(state)),
-            catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
-          });
-          lastState = state;
-          lastResult = result;
-          if (recoveryContent != null) {
-            const quarantine = yield* quarantineStateEffect(file, recoveryContent);
-            if (quarantine.error != null) {
-              const notice = {
-                stateFile: file,
-                quarantineFile: quarantine.quarantineFile,
-                outcome: "quarantineFailed",
-                error: quarantine.error
-              };
-              try {
-                console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
-              } catch {}
-              reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error);
-              notifyStateRecovery(notice);
-            } else {
-              const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile);
-              if (!unchanged) {
-                const message = "goal state changed while recovery was being quarantined; refusing to overwrite it";
-                notifyStateRecovery({
-                  stateFile: file,
-                  quarantineFile: quarantine.quarantineFile,
-                  outcome: "sourceChanged",
-                  error: message
-                });
-                return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }));
-              }
-              try {
-                console.warn(`[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`);
-              } catch {}
-              notifyStateRecovery({
-                stateFile: file,
-                quarantineFile: quarantine.quarantineFile,
-                outcome: "quarantined"
-              });
-            }
+    return withStateLock(file, () => Effect.runPromise(Effect.gen(function* () {
+      const { state, recoveryContent } = yield* readStateResultEffect(file);
+      const result = yield* Effect.tryPromise({
+        try: () => Promise.resolve(fn(state)),
+        catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
+      });
+      if (recoveryContent != null) {
+        const quarantine = yield* quarantineStateEffect(file, recoveryContent);
+        if (quarantine.error != null) {
+          const notice = {
+            stateFile: file,
+            quarantineFile: quarantine.quarantineFile,
+            outcome: "quarantineFailed",
+            error: quarantine.error
+          };
+          try {
+            console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
+          } catch {}
+          reportPluginError(`Could not quarantine corrupt state at ${file}`, quarantine.error);
+          notifyStateRecovery(notice);
+        } else {
+          const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent);
+          if (!unchanged) {
+            const message = "goal state changed while recovery was being quarantined; refusing to overwrite it";
+            notifyStateRecovery({
+              stateFile: file,
+              quarantineFile: quarantine.quarantineFile,
+              outcome: "sourceChanged",
+              error: message
+            });
+            return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }));
           }
-          const current = yield* readRawStateEffect(file);
-          if (current !== raw)
-            continue;
-          if (recoveryContent != null || shouldWrite(result))
-            yield* writeStateEffect(state, file);
-          return result;
+          try {
+            console.warn(`[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`);
+          } catch {}
+          notifyStateRecovery({
+            stateFile: file,
+            quarantineFile: quarantine.quarantineFile,
+            outcome: "quarantined"
+          });
         }
-        if (lastState)
-          yield* writeStateEffect(lastState, file);
-        return lastResult;
-      }));
-    } finally {
-      await lock.release();
-    }
+      }
+      if (recoveryContent != null || shouldWrite(result))
+        yield* writeStateEffect(state, file);
+      return result;
+    })));
   });
 }
 var DEFAULT_MAX_OBJECTIVE_CHARS = 1e5;
@@ -3945,6 +3952,8 @@ var server = async ({ client }, options) => {
         restartAfterContinuation.add(sessionID);
       else
         restartAfterContinuation.delete(sessionID);
+      if (mode === "replace" && busySessions.has(sessionID))
+        armTurnWatchdog(sessionID);
     }
   };
   const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile, outcome, error }) => {
@@ -4579,10 +4588,10 @@ var server = async ({ client }, options) => {
             busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1);
             nativeRetrySessions.delete(sessionID);
           }
-          if (status2.type === "busy")
-            armTurnWatchdog(sessionID);
-          if (status2.type === "busy")
+          if (status2.type === "busy") {
             await markPendingContinuationStarted(sessionID);
+            armTurnWatchdog(sessionID);
+          }
           if (status2.type === "idle") {
             explicitResumeRequests.delete(sessionID);
             busySessions.delete(sessionID);
@@ -4757,6 +4766,8 @@ async function setupV2(context) {
         stoppedExecutions.delete(sessionID);
       else
         stoppedExecutions.add(sessionID);
+      if (mode === "replace" && busySessions.has(sessionID))
+        armTurnWatchdog(sessionID);
     }
   };
   let autonomyAvailable = true;
@@ -5256,8 +5267,8 @@ async function setupV2(context) {
             busySessions.add(sessionID);
             busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1);
             nativeRetrySessions.delete(sessionID);
-            armTurnWatchdog(sessionID);
             await markPendingContinuationStarted(sessionID);
+            armTurnWatchdog(sessionID);
           }
           if (status2.type === "idle") {
             explicitResumeRequests.delete(sessionID);
@@ -5306,7 +5317,6 @@ async function setupV2(context) {
       case "session.execution.interrupted": {
         if (!sessionID)
           return;
-        await releaseDeliveredShellDeferrals(sessionID);
         explicitResumeRequests.delete(sessionID);
         stoppedExecutions.add(sessionID);
         busySessions.delete(sessionID);
@@ -5316,6 +5326,7 @@ async function setupV2(context) {
         goalServices.stopAutonomy?.(sessionID);
         clearToolAttemptsForSession(toolAttempts, sessionID);
         taskTracker.observeSessionStatus(sessionID, "idle");
+        await releaseDeliveredShellDeferrals(sessionID);
         if (data.reason === "user")
           await cancelActiveGoal(sessionID);
         return;
@@ -5323,7 +5334,6 @@ async function setupV2(context) {
       case "session.execution.failed": {
         if (!sessionID)
           return;
-        await releaseDeliveredShellDeferrals(sessionID);
         explicitResumeRequests.delete(sessionID);
         nativeRetrySessions.delete(sessionID);
         busySessions.delete(sessionID);
@@ -5336,6 +5346,7 @@ async function setupV2(context) {
           taskDeferredSessions.delete(sessionID);
         }
         taskTracker.observeSessionStatus(sessionID, "idle");
+        await releaseDeliveredShellDeferrals(sessionID);
         if (errorMessage && isTransportError(errorMessage)) {
           const goal = await getGoalInternal(sessionID);
           if (goal?.status === "active") {
@@ -5396,6 +5407,8 @@ async function setupV2(context) {
       case "session.step.started": {
         if (!sessionID || typeof data.assistantMessageID !== "string")
           return;
+        if (scheduledContinuations.get(sessionID)?.purpose === "recovery")
+          cancelScheduledContinuation(sessionID);
         const messageID2 = data.assistantMessageID;
         const agent = typeof data.agent === "string" ? data.agent : undefined;
         if (agent)
@@ -5425,6 +5438,12 @@ async function setupV2(context) {
         if (!sessionID || typeof data.assistantMessageID !== "string")
           return;
         const messageID2 = data.assistantMessageID;
+        const text2 = stepTextBuffers.get(stepKey(sessionID, messageID2)) ?? "";
+        if (/[\p{L}\p{N}]/u.test(text2)) {
+          const scheduled = scheduledContinuations.get(sessionID);
+          if (scheduled?.purpose === "recovery")
+            cancelScheduledContinuation(sessionID);
+        }
         const tokens = tokensFromRecord(data.tokens);
         if (typeof tokens === "number") {
           const sum = (stepTokenSums.get(sessionID) ?? 0) + tokens;
@@ -5435,7 +5454,6 @@ async function setupV2(context) {
             initialBaseline: Math.ceil(sum - tokens)
           });
         }
-        const text2 = stepTextBuffers.get(stepKey(sessionID, messageID2)) ?? "";
         stepTextBuffers.delete(stepKey(sessionID, messageID2));
         const outputTokens = outputTokensFromRecord(data.tokens) ?? null;
         const afterStep = await recordAssistantProgress(sessionID, {
@@ -5447,11 +5465,6 @@ async function setupV2(context) {
           completedAt: event.created
         });
         await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, afterStep);
-        if (/[\p{L}\p{N}]/u.test(text2)) {
-          const scheduled = scheduledContinuations.get(sessionID);
-          if (scheduled?.purpose === "recovery")
-            cancelScheduledContinuation(sessionID);
-        }
         latestStepBySession.set(sessionID, {
           messageID: messageID2,
           agent: latestStepBySession.get(sessionID)?.agent,
@@ -5465,6 +5478,12 @@ async function setupV2(context) {
         if (!sessionID || typeof data.assistantMessageID !== "string")
           return;
         const messageID2 = data.assistantMessageID;
+        const text2 = stepTextBuffers.get(stepKey(sessionID, messageID2)) ?? "";
+        if (/[\p{L}\p{N}]/u.test(text2)) {
+          const scheduled = scheduledContinuations.get(sessionID);
+          if (scheduled?.purpose === "recovery")
+            cancelScheduledContinuation(sessionID);
+        }
         const tokens = tokensFromRecord(data.tokens);
         if (typeof tokens === "number") {
           const sum = (stepTokenSums.get(sessionID) ?? 0) + tokens;
@@ -5475,7 +5494,6 @@ async function setupV2(context) {
             initialBaseline: Math.ceil(sum - tokens)
           });
         }
-        const text2 = stepTextBuffers.get(stepKey(sessionID, messageID2)) ?? "";
         stepTextBuffers.delete(stepKey(sessionID, messageID2));
         const outputTokens = outputTokensFromRecord(data.tokens) ?? null;
         const afterStep = await recordAssistantProgress(sessionID, {
@@ -5487,11 +5505,6 @@ async function setupV2(context) {
           completedAt: event.created
         });
         await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, afterStep);
-        if (/[\p{L}\p{N}]/u.test(text2)) {
-          const scheduled = scheduledContinuations.get(sessionID);
-          if (scheduled?.purpose === "recovery")
-            cancelScheduledContinuation(sessionID);
-        }
         latestStepBySession.set(sessionID, {
           messageID: messageID2,
           agent: latestStepBySession.get(sessionID)?.agent,
@@ -5590,7 +5603,7 @@ async function setupV2(context) {
                   pursuedGoalID ??= goal.id;
                   if (goal.id !== pursuedGoalID)
                     break;
-                  await new Promise((resolve) => setTimeout(resolve, 250));
+                  await new Promise((resolve2) => setTimeout(resolve2, 250));
                 } while (!disposed && !signal.aborted);
               }
             } catch (error) {
@@ -5700,10 +5713,13 @@ async function setupV2(context) {
       return;
     if (toolOutputFailed(input.result))
       return;
+    const recovering = Boolean(text2?.trim()) && expectedAttemptID == null && scheduledContinuations.get(sessionID)?.purpose === "recovery";
+    if (recovering)
+      cancelScheduledContinuation(sessionID);
     const before = await getGoalInternal(sessionID);
-    if (!before || before.status !== "active" || !before.awaitingContinuationProgress && before.continuationFailures === 0 && before.pendingAttempt == null && scheduledContinuations.get(sessionID)?.purpose !== "recovery")
+    if (!before || before.status !== "active" || !before.awaitingContinuationProgress && before.continuationFailures === 0 && before.pendingAttempt == null && scheduledContinuations.get(sessionID)?.purpose !== "recovery" && !recovering)
       return;
-    const resolvingFailure = Boolean(before && (before.continuationFailures > 0 || before.pendingAttempt != null)) || scheduledContinuations.get(sessionID)?.purpose === "recovery";
+    const resolvingFailure = Boolean(before && (before.continuationFailures > 0 || before.pendingAttempt != null)) || recovering || scheduledContinuations.get(sessionID)?.purpose === "recovery";
     const progressed = await recordToolProgress(sessionID, text2, expectedAttemptID, !NON_SUBSTANTIVE_TOOLS.has(input.tool.toLowerCase()));
     if (resolvingFailure && progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
       locallyDeliveredPendingSessions.delete(sessionID);
@@ -5811,7 +5827,7 @@ async function setupV2(context) {
       }
     }
     const termination = Promise.allSettled([consumer, eventIterator?.return?.()]);
-    await Promise.race([termination, new Promise((resolve) => setTimeout(resolve, 2000))]);
+    await Promise.race([termination, new Promise((resolve2) => setTimeout(resolve2, 2000))]);
   };
 }
 function goalToolsV2(services) {

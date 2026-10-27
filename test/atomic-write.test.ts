@@ -627,38 +627,68 @@ test("a non-transient rename error is never retried", async () => {
   expect(await leftoverTmpFiles()).toEqual([])
 })
 
-test("a transient exclusive create of the temp file is retried", async () => {
-  // Creating the temp file can fail the same way the rename does: on Windows a
-  // directory that another process is modifying can make an exclusive create
-  // fail with EPERM. A failed write loses a goal update, so the create is
-  // retried with a bounded budget.
-  let attempts = 0
+for (const code of ["EPERM", "EACCES", "EBUSY"]) {
+  test(`Windows temp creation recovers from ${code} without leftover files`, async () => {
+    let attempts = 0
+    const { ops } = makeRecordingOps({
+      ops: {
+        platform: "win32",
+        async open(path, flags, mode) {
+          if (++attempts < 4) throw errno(code, "temporarily unavailable")
+          return defaultAtomicWriteOps.open(path, flags, mode)
+        },
+      },
+    })
+    await atomicWriteFile(file, "payload", ops)
+    expect(attempts).toBe(4)
+    expect(await readFile(file, "utf8")).toBe("payload")
+    expect(await leftoverTmpFiles()).toEqual([])
+  })
+
+  test(`Windows temp creation exhausts ${code} and preserves existing JSON`, async () => {
+    await writeFile(file, DATA)
+    let attempts = 0
+    const { ops } = makeRecordingOps({
+      ops: {
+        platform: "win32",
+        async open() { attempts++; throw errno(code, "still unavailable") },
+      },
+    })
+    await expect(atomicWriteFile(file, "payload", ops)).rejects.toThrow("still unavailable")
+    expect(attempts).toBe(OPEN_ATTEMPTS)
+    expect(await readFile(file, "utf8")).toBe(DATA)
+    expect(await leftoverTmpFiles()).toEqual([])
+  })
+
+  test(`POSIX temp creation rejects ${code} immediately`, async () => {
+    let attempts = 0
+    const { ops } = makeRecordingOps({
+      ops: {
+        platform: "linux",
+        async open() { attempts++; throw errno(code, "unavailable") },
+      },
+    })
+    await expect(atomicWriteFile(file, DATA, ops)).rejects.toThrow("unavailable")
+    expect(attempts).toBe(1)
+    expect(await leftoverTmpFiles()).toEqual([])
+  })
+}
+
+test("a temp path collision preserves the other creator's file", async () => {
+  await writeFile(file, DATA)
+  let collision = ""
   const { ops } = makeRecordingOps({
     ops: {
       platform: "win32",
       async open(path, flags, mode) {
-        attempts += 1
-        if (attempts === 1) throw errno("EPERM", "operation not permitted")
+        collision = path
+        await writeFile(path, "another writer", { flag: "wx" })
         return defaultAtomicWriteOps.open(path, flags, mode)
       },
     },
   })
-  await atomicWriteFile(file, "payload", ops)
-  expect(attempts).toBe(2)
-  expect(await readFile(file, "utf8")).toBe("payload")
-})
-
-test("a persistent exclusive create failure is not retried forever", async () => {
-  let attempts = 0
-  const { ops } = makeRecordingOps({
-    ops: {
-      platform: "win32",
-      async open() {
-        attempts += 1
-        throw errno("EPERM", "operation not permitted")
-      },
-    },
-  })
-  await expect(atomicWriteFile(file, "payload", ops)).rejects.toThrow()
-  expect(attempts).toBe(OPEN_ATTEMPTS)
+  await expect(atomicWriteFile(file, "replacement", ops)).rejects.toMatchObject({ code: "EEXIST" })
+  expect(await readFile(collision, "utf8")).toBe("another writer")
+  expect(await readFile(file, "utf8")).toBe(DATA)
+  expect(await leftoverTmpFiles()).toHaveLength(1)
 })

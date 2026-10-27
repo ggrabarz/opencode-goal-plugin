@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { mkdtempSync, readFileSync, readdirSync, realpathSync } from "node:fs"
-import { mkdir, rename, rm } from "node:fs/promises"
+import { mkdir, rename, rm, symlink } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { satisfies } from "semver"
@@ -24,7 +24,7 @@ test("published tui entrypoint shares host runtime instances via peerDependencie
   }
 })
 
-test("the packed plugin resolves through Bun and Node CommonJS and ESM entrypoints", async () => {
+test("the packed plugin resolves its entrypoints and mutates state under Bun and Node", async () => {
   const root = mkdtempSync(join(tmpdir(), "goal-package-resolution-"))
   try {
     const packed = Bun.spawnSync(["npm", "pack", "--ignore-scripts", "--pack-destination", root], {
@@ -41,6 +41,31 @@ test("the packed plugin resolves through Bun and Node CommonJS and ESM entrypoin
     const entrypoints = { "": "dist/server.js", "/server": "dist/server.js", "/tui": "src/tui.ts" }
     for (const [suffix, target] of Object.entries(entrypoints)) {
       expect(Bun.resolveSync(name + suffix, root)).toBe(realpathSync(join(root, "node_modules", name, target)))
+    }
+    const manifest = JSON.parse(readFileSync("package.json", "utf8"))
+    for (const dependency of Object.keys(manifest.dependencies)) {
+      await symlink(realpathSync(join("node_modules", dependency)), join(root, "node_modules", dependency), "junction")
+    }
+    for (const runtime of [process.execPath, "node"]) {
+      const mutated = Bun.spawnSync([runtime, "--input-type=module", "-e", `
+        import assert from "node:assert/strict"
+        import { readFile } from "node:fs/promises"
+        import plugin from "@prevalentware/opencode-goal-plugin/server"
+        const hooks = await plugin.server({ client: {} }, { auto_continue: false })
+        try {
+          const context = { sessionID: "packed", agent: "build" }
+          await hooks.tool.create_goal.execute({ objective: "Packed runtime mutation" }, context)
+          const goal = JSON.parse(await hooks.tool.get_goal.execute({}, context))
+          assert.equal(goal.goal.objective, "Packed runtime mutation")
+          const persisted = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH, "utf8"))
+          assert.equal(persisted.goals.packed.objective, "Packed runtime mutation")
+          assert.equal(persisted.version, 3)
+        } finally { await hooks.dispose() }
+      `], {
+        cwd: root, stdout: "pipe", stderr: "pipe", timeout: 15000,
+        env: { ...process.env, OPENCODE_GOAL_STATE_PATH: join(root, runtime === "node" ? "node.json" : "bun.json") },
+      })
+      if (mutated.exitCode !== 0) throw new Error(`${runtime}: ${mutated.stderr.toString()}`)
     }
     const checked = Bun.spawnSync(["node", "--input-type=module", "-e", `
       import assert from "node:assert/strict"
@@ -61,7 +86,7 @@ test("the packed plugin resolves through Bun and Node CommonJS and ESM entrypoin
   } finally {
     await rm(root, { recursive: true, force: true })
   }
-}, 30000)
+}, 60000)
 
 test("engines.opencode covers the V2 beta line and the V1 floor while excluding older stable releases", () => {
   const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {

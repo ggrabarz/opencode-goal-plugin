@@ -84,34 +84,14 @@ export function isUnsupportedSyncDirError(error: unknown, platform: NodeJS.Platf
   )
 }
 
-/**
- * Errors that can transiently fail a same-directory rename, most commonly on
- * Windows when the target file is briefly locked by another process (antivirus
- * scanners, an OpenCode session holding the state file open). These are worth a
- * small bounded retry before giving up. Anything else (EIO, ENOENT, ENOSPC...)
- * is a genuine failure and must not be retried.
- */
-export function isTransientRenameError(error: unknown, platform: NodeJS.Platform): boolean {
+export function isTransientWindowsFileError(error: unknown, platform: NodeJS.Platform): boolean {
   if (platform !== "win32") return false
   const code = (error as NodeJS.ErrnoException | null)?.code
   return code === "EPERM" || code === "EACCES" || code === "EBUSY"
 }
 
-/**
- * Total attempts for a transient exclusive create of the temp file.
- *
- * Creating the temp file can fail the same way the rename does: on Windows a
- * directory that another process is modifying, or a scanner that is walking
- * it, can make an exclusive create fail with EPERM even though nothing is
- * holding the temp path. The write is the most important operation in the
- * plugin, because a failed write loses a goal update, so the create is
- * retried with the same bounded budget as the rename.
- */
 export const OPEN_ATTEMPTS = 10
 
-/**
- * Open the temp file, retrying a transient exclusive-create failure.
- */
 async function openWithRetry(
   ops: AtomicWriteOps,
   path: string,
@@ -124,7 +104,7 @@ async function openWithRetry(
       return await ops.open(path, flags, mode)
     } catch (error) {
       attempt += 1
-      if (!isTransientRenameError(error, ops.platform) || attempt >= OPEN_ATTEMPTS) throw error
+      if (!isTransientWindowsFileError(error, ops.platform) || attempt >= OPEN_ATTEMPTS) throw error
       await ops.sleep(renameRetryDelayMs(attempt))
     }
   }
@@ -239,7 +219,7 @@ async function renameWithRetry(ops: AtomicWriteOps, from: string, to: string): P
       attempt += 1
       // A non-transient error fails immediately; transient errors get a small,
       // bounded number of attempts (renaming over a briefly-locked target).
-      if (!isTransientRenameError(error, ops.platform) || attempt >= RENAME_ATTEMPTS) throw error
+      if (!isTransientWindowsFileError(error, ops.platform) || attempt >= RENAME_ATTEMPTS) throw error
       await ops.sleep(renameRetryDelayMs(attempt))
     }
   }

@@ -1601,6 +1601,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       locallyDeliveredPendingSessions.delete(sessionID)
       if (mode === "replace" && activeContinuations.has(sessionID)) restartAfterContinuation.add(sessionID)
       else restartAfterContinuation.delete(sessionID)
+      if (mode === "replace" && busySessions.has(sessionID)) armTurnWatchdog(sessionID)
     },
   }
   const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile, outcome, error }) => {
@@ -2324,8 +2325,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
             busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1)
             nativeRetrySessions.delete(sessionID)
           }
-          if (status.type === "busy") armTurnWatchdog(sessionID)
-          if (status.type === "busy") await markPendingContinuationStarted(sessionID)
+          if (status.type === "busy") {
+            await markPendingContinuationStarted(sessionID)
+            armTurnWatchdog(sessionID)
+          }
           if (status.type === "idle") {
             explicitResumeRequests.delete(sessionID)
             busySessions.delete(sessionID)
@@ -2528,6 +2531,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       else restartAfterContinuation.delete(sessionID)
       if (mode === "replace") stoppedExecutions.delete(sessionID)
       else stoppedExecutions.add(sessionID)
+      if (mode === "replace" && busySessions.has(sessionID)) armTurnWatchdog(sessionID)
     },
   }
   let autonomyAvailable = true
@@ -3113,8 +3117,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             busySessions.add(sessionID)
             busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1)
             nativeRetrySessions.delete(sessionID)
-            armTurnWatchdog(sessionID)
             await markPendingContinuationStarted(sessionID)
+            armTurnWatchdog(sessionID)
           }
           if (status.type === "idle") {
             explicitResumeRequests.delete(sessionID)
@@ -3168,7 +3172,6 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       case "session.execution.interrupted": {
         if (!sessionID) return
-        await releaseDeliveredShellDeferrals(sessionID)
         explicitResumeRequests.delete(sessionID)
         stoppedExecutions.add(sessionID)
         busySessions.delete(sessionID)
@@ -3178,12 +3181,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         goalServices.stopAutonomy?.(sessionID)
         clearToolAttemptsForSession(toolAttempts, sessionID)
         taskTracker.observeSessionStatus(sessionID, "idle")
+        await releaseDeliveredShellDeferrals(sessionID)
         if (data.reason === "user") await cancelActiveGoal(sessionID)
         return
       }
       case "session.execution.failed": {
         if (!sessionID) return
-        await releaseDeliveredShellDeferrals(sessionID)
         explicitResumeRequests.delete(sessionID)
         // execution.failed is emitted only after the host's retry episode has
         // ended, so the failure can still recover.
@@ -3198,6 +3201,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           taskDeferredSessions.delete(sessionID)
         }
         taskTracker.observeSessionStatus(sessionID, "idle")
+        await releaseDeliveredShellDeferrals(sessionID)
         if (errorMessage && isTransportError(errorMessage)) {
           const goal = await getGoalInternal(sessionID)
           if (goal?.status === "active") {
@@ -3269,6 +3273,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       case "session.step.started": {
         if (!sessionID || typeof data.assistantMessageID !== "string") return
+        if (scheduledContinuations.get(sessionID)?.purpose === "recovery") cancelScheduledContinuation(sessionID)
         const messageID = data.assistantMessageID
         const agent = typeof data.agent === "string" ? data.agent : undefined
         if (agent) await recordPromptAgent(sessionID, agent)
@@ -3295,6 +3300,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       case "session.step.ended": {
         if (!sessionID || typeof data.assistantMessageID !== "string") return
         const messageID = data.assistantMessageID
+        const text = stepTextBuffers.get(stepKey(sessionID, messageID)) ?? ""
+        if (/[\p{L}\p{N}]/u.test(text)) {
+          const scheduled = scheduledContinuations.get(sessionID)
+          if (scheduled?.purpose === "recovery") cancelScheduledContinuation(sessionID)
+        }
         const tokens = tokensFromRecord(data.tokens)
         if (typeof tokens === "number") {
           const sum = (stepTokenSums.get(sessionID) ?? 0) + tokens
@@ -3305,7 +3315,6 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             initialBaseline: Math.ceil(sum - tokens),
           })
         }
-        const text = stepTextBuffers.get(stepKey(sessionID, messageID)) ?? ""
         stepTextBuffers.delete(stepKey(sessionID, messageID))
         const outputTokens = outputTokensFromRecord(data.tokens) ?? null
         const afterStep = await recordAssistantProgress(sessionID, {
@@ -3317,12 +3326,6 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           completedAt: event.created,
         })
         await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, afterStep)
-        // Substantive output from the model proves the transport recovered, so
-        // any pending automatic recovery timer is no longer needed.
-        if (/[\p{L}\p{N}]/u.test(text)) {
-          const scheduled = scheduledContinuations.get(sessionID)
-          if (scheduled?.purpose === "recovery") cancelScheduledContinuation(sessionID)
-        }
         latestStepBySession.set(sessionID, {
           messageID,
           agent: latestStepBySession.get(sessionID)?.agent,
@@ -3335,6 +3338,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       case "session.step.failed": {
         if (!sessionID || typeof data.assistantMessageID !== "string") return
         const messageID = data.assistantMessageID
+        const text = stepTextBuffers.get(stepKey(sessionID, messageID)) ?? ""
+        if (/[\p{L}\p{N}]/u.test(text)) {
+          const scheduled = scheduledContinuations.get(sessionID)
+          if (scheduled?.purpose === "recovery") cancelScheduledContinuation(sessionID)
+        }
         const tokens = tokensFromRecord(data.tokens)
         if (typeof tokens === "number") {
           const sum = (stepTokenSums.get(sessionID) ?? 0) + tokens
@@ -3345,7 +3353,6 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             initialBaseline: Math.ceil(sum - tokens),
           })
         }
-        const text = stepTextBuffers.get(stepKey(sessionID, messageID)) ?? ""
         stepTextBuffers.delete(stepKey(sessionID, messageID))
         const outputTokens = outputTokensFromRecord(data.tokens) ?? null
         const afterStep = await recordAssistantProgress(sessionID, {
@@ -3357,10 +3364,6 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           completedAt: event.created,
         })
         await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, afterStep)
-        if (/[\p{L}\p{N}]/u.test(text)) {
-          const scheduled = scheduledContinuations.get(sessionID)
-          if (scheduled?.purpose === "recovery") cancelScheduledContinuation(sessionID)
-        }
         latestStepBySession.set(sessionID, {
           messageID,
           agent: latestStepBySession.get(sessionID)?.agent,
@@ -3598,18 +3601,17 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         { tool: input.tool, sessionID: input.sessionID, callID: input.id },
         { output: textFromToolResult(input.result) },
       )
-      // A successful tool output is real progress: it resolves any pending
-      // continuation and clears the prompt-failure counter. This body is async
-      // so recovery cancellation completes before any pending recovery timer.
       if (!tracksToolStarts || !sessionID || typeof input.tool !== "string") return
       if (NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
       if (toolOutputFailed(input.result)) return
+      const recovering = Boolean(text?.trim()) && expectedAttemptID == null && scheduledContinuations.get(sessionID)?.purpose === "recovery"
+      if (recovering) cancelScheduledContinuation(sessionID)
       const before = await getGoalInternal(sessionID)
       if (!before || before.status !== "active" ||
         (!before.awaitingContinuationProgress && before.continuationFailures === 0 && before.pendingAttempt == null &&
-          scheduledContinuations.get(sessionID)?.purpose !== "recovery")) return
+          scheduledContinuations.get(sessionID)?.purpose !== "recovery" && !recovering)) return
       const resolvingFailure = Boolean(before && (before.continuationFailures > 0 || before.pendingAttempt != null)) ||
-        scheduledContinuations.get(sessionID)?.purpose === "recovery"
+        recovering || scheduledContinuations.get(sessionID)?.purpose === "recovery"
       const progressed = await recordToolProgress(sessionID, text, expectedAttemptID, !NON_SUBSTANTIVE_TOOLS.has(input.tool.toLowerCase()))
       if (resolvingFailure && progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
         locallyDeliveredPendingSessions.delete(sessionID)

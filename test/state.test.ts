@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, stat, unlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { z } from "zod"
+import { defaultStateReadOps } from "../src/state-read"
 import {
   accountUsage,
   cancelGoal,
@@ -1435,3 +1436,32 @@ test("rolling back a later continuation restores the previous non-null milliseco
   setSystemTime(new Date(base + 1901))
   expect(await reserveContinuation("ses_1", 10, 1)).not.toBeNull()
 })
+
+for (const outcome of ["missing", "changed", "unreadable"]) {
+  test(`recovery source ${outcome} preserves its mutation contract`, async () => {
+    const file = process.env.OPENCODE_GOAL_STATE_PATH!
+    const damaged = "\0\0"
+    const replacement = '{"version":1,"goals":{}}'
+    await writeFile(file, damaged)
+    const read = defaultStateReadOps.readFile
+    let reads = 0
+    const reader = spyOn(defaultStateReadOps, "readFile").mockImplementation(async (path) => {
+      if (path === file && ++reads === 2) {
+        if (outcome === "unreadable") throw Object.assign(new Error("source unavailable"), { code: "EIO" })
+        if (outcome === "missing") await unlink(file)
+        else await writeFile(file, replacement)
+      }
+      return read(path)
+    })
+    try {
+      const mutation = createGoal("recovered", "recover verified source")
+      if (outcome === "missing") await mutation
+      else await expect(mutation).rejects.toThrow()
+    } finally { reader.mockRestore() }
+    const quarantines = (await readdir(dir)).filter((name) => name.includes(".corrupt-"))
+    expect(quarantines).toHaveLength(1)
+    expect(await readFile(join(dir, quarantines[0]!), "utf8")).toBe(damaged)
+    if (outcome === "missing") expect((await getGoal("recovered"))?.objective).toBe("recover verified source")
+    else expect(await readFile(file, "utf8")).toBe(outcome === "changed" ? replacement : damaged)
+  })
+}
