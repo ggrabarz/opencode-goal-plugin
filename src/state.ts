@@ -94,6 +94,33 @@ export type PendingAttempt = {
   previousLastContinuationAtMs: number | null
 }
 
+export type ShellDeferral = {
+  shellID: string
+  notificationID: string | null
+  delivered: boolean
+  hostPID: number | null
+  hostStartedAt: number | null
+}
+
+const hostPID = process.pid
+const hostStartedAt = Math.round(Date.now() / 1000 - process.uptime())
+
+function isCurrentHost(deferral: ShellDeferral) {
+  return deferral.hostPID === hostPID && deferral.hostStartedAt != null && Math.abs(deferral.hostStartedAt - hostStartedAt) <= 2
+}
+
+function isStaleHost(deferral: ShellDeferral) {
+  if (isCurrentHost(deferral)) return false
+  if (deferral.hostPID === hostPID) return true
+  if (!Number.isSafeInteger(deferral.hostPID) || (deferral.hostPID ?? 0) <= 0) return true
+  try {
+    process.kill(deferral.hostPID!, 0)
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH"
+  }
+}
+
 export type Goal = {
   id: string
   sessionID: string
@@ -122,6 +149,7 @@ export type Goal = {
   lastContinuationAtMs: number | null
   continuationFailures: number
   pendingAttempt: PendingAttempt | null
+  shellDeferrals: ShellDeferral[]
   lastStatus: string | null
   maxAutoTurns: number | null
   maxDurationSeconds: number | null
@@ -139,6 +167,7 @@ export type Goal = {
   awaitingContinuationProgress: boolean
   continuationBaselineMessageID: string
   continuationBaselineSummary: string
+  continuationToolCalls: number
 }
 
 type UsageTracker = {
@@ -237,6 +266,13 @@ const PendingAttemptSchema = Schema.Struct({
   previousLastContinuationAt: Schema.NullOr(Schema.Number),
   previousLastContinuationAtMs: Schema.optionalWith(NullableNumber, { default: () => null }),
 })
+const ShellDeferralSchema = Schema.Struct({
+  shellID: Schema.String,
+  notificationID: Schema.NullOr(Schema.String),
+  delivered: Schema.Boolean,
+  hostPID: Schema.optionalWith(Schema.NullOr(Schema.Number), { default: () => null }),
+  hostStartedAt: Schema.optionalWith(Schema.NullOr(Schema.Number), { default: () => null }),
+})
 const UsageTrackerSchema = Schema.Struct({
   baseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
   lastObserved: Schema.optionalWith(Schema.Unknown, { default: () => null }),
@@ -267,6 +303,7 @@ const GoalSchema = Schema.Struct({
   lastContinuationAtMs: Schema.optionalWith(NullableNumber, { default: () => null }),
   continuationFailures: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   pendingAttempt: Schema.optionalWith(Schema.NullOr(PendingAttemptSchema), { default: () => null }),
+  shellDeferrals: Schema.optionalWith(Schema.Array(ShellDeferralSchema), { default: () => [] }),
   lastStatus: Schema.optionalWith(NullableString, { default: () => null }),
   maxAutoTurns: Schema.optionalWith(NullableNumber, { default: () => null }),
   maxDurationSeconds: Schema.optionalWith(NullableNumber, { default: () => null }),
@@ -284,6 +321,7 @@ const GoalSchema = Schema.Struct({
   awaitingContinuationProgress: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   continuationBaselineMessageID: Schema.optionalWith(Schema.String, { default: () => "" }),
   continuationBaselineSummary: Schema.optionalWith(Schema.String, { default: () => "" }),
+  continuationToolCalls: Schema.optionalWith(Schema.Number, { default: () => 0 }),
 })
 const ArchivedGoalSchema = Schema.Struct({
   id: Schema.String,
@@ -322,8 +360,10 @@ const PersistedStateSchema = Schema.Union(LegacyStateSchema, StateSchema)
 // getGoalInternal / the internal snapshot type instead.
 export type GoalSnapshot = Omit<
   Goal,
-  "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "lastContinuationAtMs" | "pendingAttempt" | "usageTrackers"
+  "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "lastContinuationAtMs" | "pendingAttempt" |
+  "usageTrackers" | "shellDeferrals" | "continuationToolCalls"
 > & {
+  waitingForShellIDs: string[]
   remainingTokens: number | null
   sampledAt: number
   planProgress: ReturnType<typeof goalPlanProgress> | null
@@ -334,6 +374,8 @@ export type GoalSnapshot = Omit<
 /** Internal view of a goal with the pending-attempt lifecycle exposed. */
 export type InternalGoalSnapshot = GoalSnapshot & {
   pendingAttempt: PendingAttempt | null
+  shellDeferrals: ShellDeferral[]
+  lastContinuationAtMs: number | null
 }
 
 export type GoalListItem = Pick<
@@ -543,7 +585,7 @@ function enqueueMutation<T>(operation: () => Promise<T>) {
   return current
 }
 
-async function mutate<T>(fn: (state: State) => T | Promise<T>) {
+async function mutate<T>(fn: (state: State) => T | Promise<T>, shouldWrite: (result: T) => boolean = () => true) {
   return enqueueMutation(() => {
     const file = statePath()
     return Effect.runPromise(
@@ -598,7 +640,7 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
             })
           }
         }
-        yield* writeStateEffect(state, file)
+        if (recoveryContent != null || shouldWrite(result)) yield* writeStateEffect(state, file)
         return result
       }),
     )
@@ -666,8 +708,12 @@ function normalizeGoal(goal: Goal) {
       ? Math.floor(goal.lastContinuationAtMs)
       : null
   goal.pendingAttempt = normalizePendingAttempt(goal.pendingAttempt)
+  goal.shellDeferrals = (goal.shellDeferrals ?? []).filter(
+    (item) => typeof item.shellID === "string" && item.shellID.length > 0,
+  )
   goal.continuationBaselineMessageID ??= ""
   goal.continuationBaselineSummary ??= ""
+  goal.continuationToolCalls = nonNegativeInteger(goal.continuationToolCalls, 0)
   goal.noProgressTurns = nonNegativeInteger(goal.noProgressTurns, 0)
   goal.maxAutoTurns = positiveIntegerOrNull(goal.maxAutoTurns)
   goal.maxDurationSeconds = positiveIntegerOrNull(goal.maxDurationSeconds)
@@ -819,12 +865,16 @@ export function snapshot(goal: Goal): GoalSnapshot {
     autoTurns: goal.autoTurns,
     lastContinuationAt: goal.lastContinuationAt,
     remainingTokens: remainingTokens(goal),
+    waitingForShellIDs: goal.shellDeferrals.filter((item) => !item.delivered).map((item) => item.shellID),
     sampledAt,
   }
 }
 
 export function snapshotInternal(goal: Goal): InternalGoalSnapshot {
-  return { ...snapshot(goal), pendingAttempt: goal.pendingAttempt }
+  return {
+    ...snapshot(goal), pendingAttempt: goal.pendingAttempt,
+    shellDeferrals: goal.shellDeferrals, lastContinuationAtMs: goal.lastContinuationAtMs,
+  }
 }
 
 export async function getGoal(sessionID: string) {
@@ -877,6 +927,86 @@ export async function getGoalInternal(sessionID: string) {
   return goal ? snapshotInternal(goal) : null
 }
 
+export async function deferGoalUntilShell(sessionID: string, shellID: string) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || goal.status !== "active") throw new Error("an active goal is required to defer for a Shell result")
+    if (!goal.shellDeferrals.some((item) => item.shellID === shellID)) {
+      goal.shellDeferrals.push({ shellID, notificationID: null, delivered: false, hostPID, hostStartedAt })
+      goal.lastStatus = `Waiting for Shell ${shellID}.`
+    }
+    return snapshotInternal(goal)
+  })
+}
+
+export async function noteShellNotification(sessionID: string, shellID: string, notificationID: string) {
+  return mutate((state) => {
+    const deferral = state.goals[sessionID]?.shellDeferrals.find((item) => item.shellID === shellID)
+    if (!deferral) return false
+    deferral.notificationID = notificationID
+    return true
+  })
+}
+
+export async function noteShellNotificationDelivered(sessionID: string, notificationID: string) {
+  return mutate((state) => {
+    const deferral = state.goals[sessionID]?.shellDeferrals.find((item) => item.notificationID === notificationID)
+    if (!deferral) return false
+    deferral.delivered = true
+    return true
+  })
+}
+
+export async function cancelShellNotification(sessionID: string, notificationID: string) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal) return false
+    const remaining = goal.shellDeferrals.filter((item) => item.notificationID !== notificationID)
+    if (remaining.length === goal.shellDeferrals.length) return false
+    goal.shellDeferrals = remaining
+    goal.lastStatus = "Shell completion notification cancelled; goal can continue."
+    return true
+  })
+}
+
+export async function releaseShellDeferral(sessionID: string, shellID: string) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal) return false
+    const remaining = goal.shellDeferrals.filter((item) => item.shellID !== shellID)
+    if (remaining.length === goal.shellDeferrals.length) return false
+    goal.shellDeferrals = remaining
+    goal.lastStatus = `Stopped waiting for Shell ${shellID}.`
+    return true
+  })
+}
+
+export async function releaseDeliveredShellDeferrals(sessionID: string) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal) return false
+    const remaining = goal.shellDeferrals.filter((item) => !item.delivered)
+    if (remaining.length === goal.shellDeferrals.length) return false
+    goal.shellDeferrals = remaining
+    goal.lastStatus = "Shell completion notification processed."
+    return true
+  })
+}
+
+export async function reconcileShellDeferralsForHost(sessionID: string) {
+  const current = await getGoalInternal(sessionID)
+  if (!current?.shellDeferrals.some(isStaleHost)) return false
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || goal.shellDeferrals.length === 0) return false
+    const remaining = goal.shellDeferrals.filter((item) => !isStaleHost(item))
+    if (remaining.length === goal.shellDeferrals.length) return false
+    goal.shellDeferrals = remaining
+    goal.lastStatus = "Shell wait cleared after the host process restarted; reassess the command result."
+    return true
+  })
+}
+
 export function getGoalSync(sessionID: string) {
   const state = readStateSync()
   const goal = state.goals[sessionID]
@@ -912,6 +1042,7 @@ function createGoalRecord(
     lastContinuationAtMs: null,
     continuationFailures: 0,
     pendingAttempt: null,
+    shellDeferrals: [],
     lastStatus: paused ? "Goal recorded from Plan mode; execution paused until resumed from Build mode." : "Goal set.",
     maxAutoTurns: normalizedOptions.maxAutoTurns,
     maxDurationSeconds: normalizedOptions.maxDurationSeconds,
@@ -929,6 +1060,7 @@ function createGoalRecord(
     awaitingContinuationProgress: false,
     continuationBaselineMessageID: "",
     continuationBaselineSummary: "",
+    continuationToolCalls: 0,
   }
   pushHistory(goal, "created", goalLimitSummary(goal))
   if (paused) pushHistory(goal, "paused", goal.lastStatus)
@@ -985,7 +1117,14 @@ function archiveGoal(state: State, goal: Goal) {
   pruneArchives(state)
 }
 
-function cancelGoalRecord(goal: Goal, reason: "cancelled" | "cleared" | "replaced") {
+function cancelGoalRecord(goal: Goal, reason: "cancelled" | "cleared" | "replaced" | "interrupted") {
+  if (goal.status === "cancelled" && goal.stopReason === "interrupted" && reason === "cancelled") {
+    goal.updatedAt = nowSeconds()
+    goal.stopReason = "cancelled"
+    goal.lastStatus = "Goal cancelled."
+    pushHistory(goal, "cancelled", goal.lastStatus)
+    return
+  }
   if (isClosed(goal.status)) return
   accountWallClock(goal)
   const now = nowSeconds()
@@ -998,7 +1137,9 @@ function cancelGoalRecord(goal: Goal, reason: "cancelled" | "cleared" | "replace
   goal.budgetWrapupSent = false
   goal.stopReason = reason
   goal.blocker = null
-  goal.lastStatus = reason === "replaced" ? "Goal cancelled because it was replaced." : "Goal cancelled."
+  goal.lastStatus = reason === "replaced"
+    ? "Goal cancelled because it was replaced."
+    : reason === "interrupted" ? "Goal interrupted by the user; explicit resume is available." : "Goal cancelled."
   pushHistory(goal, "cancelled", goal.lastStatus)
 }
 
@@ -1097,13 +1238,29 @@ export async function setGoalStatus(
   sessionID: string,
   status: MutableGoalStatus,
   agent?: string | null,
-  options?: { resetAutoTurnLimit?: boolean },
+  options?: { resetAutoTurnLimit?: boolean; allowInterruptedResume?: boolean; awaitingUserBlocker?: string; requireAwaitingUserResume?: boolean },
 ) {
   const agentValue = typeof agent === "string" && agent.trim() ? agent.trim() : null
+  const awaitingUserBlocker = options?.awaitingUserBlocker == null
+    ? null
+    : validateEvidence(options.awaitingUserBlocker, "awaiting-user blocker")
+  if (awaitingUserBlocker !== null && status !== "paused") {
+    throw new Error("awaiting-user blocker requires paused status")
+  }
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) throw new Error("cannot update goal because this session has no goal")
-    if (isClosed(goal.status)) throw new Error("cannot update goal status because this goal is closed")
+    if (status === "active" && options?.requireAwaitingUserResume === true &&
+      (goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited") &&
+      !(goal.status === "paused" && goal.stopReason === "awaiting user")) {
+      throw new Error("only an awaiting-user goal can resume without an explicit /goal resume or /resume_goal command")
+    }
+    const interruptedResume = status === "active" && goal.status === "cancelled" &&
+      goal.stopReason === "interrupted" && options?.allowInterruptedResume === true
+    if (isClosed(goal.status) && !interruptedResume) throw new Error("cannot update goal status because this goal is closed")
+    if (awaitingUserBlocker !== null && goal.status !== "active") {
+      throw new Error("cannot await user input because this goal is not active")
+    }
     if (goal.status === status) return snapshot(goal)
     if (status === "paused" && goal.status !== "active") return snapshot(goal)
     const resumesAutoTurnLimit =
@@ -1113,17 +1270,19 @@ export async function setGoalStatus(
       goal.stopReason?.startsWith(MAX_AUTO_CONTINUES_STOP_REASON_PREFIX) === true
     accountWallClock(goal)
     goal.status = status
+    if (interruptedResume) goal.closedAt = null
+    goal.shellDeferrals = []
     goal.updatedAt = nowSeconds()
     goal.lastAccountedAt = status === "active" ? goal.updatedAt : null
     goal.autoTurns = resumesAutoTurnLimit ? 0 : goal.autoTurns
     goal.continuationFailures = status === "active" ? 0 : goal.continuationFailures
     goal.pendingAttempt = status === "active" ? null : goal.pendingAttempt
     goal.noProgressTurns = status === "active" ? 0 : goal.noProgressTurns
-    goal.stopReason = status === "active" ? null : "paused"
+    goal.stopReason = status === "active" ? null : awaitingUserBlocker == null ? "paused" : "awaiting user"
     goal.budgetWrapupSent = status === "active" ? false : goal.budgetWrapupSent
-    goal.blocker = status === "active" ? null : goal.blocker
+    goal.blocker = status === "active" ? null : awaitingUserBlocker ?? goal.blocker
     if (agentValue) goal.lastPromptAgent = agentValue
-    goal.lastStatus = status === "active" ? "Goal resumed." : "Goal paused."
+    goal.lastStatus = status === "active" ? "Goal resumed." : awaitingUserBlocker == null ? "Goal paused." : "Goal paused awaiting user input."
     pushHistory(goal, status === "active" ? "resumed" : "paused", goal.lastStatus)
     return snapshot(goal)
   })
@@ -1232,7 +1391,7 @@ export async function cancelActiveGoal(sessionID: string) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) return null
-    if (goal.status === "active") cancelGoalRecord(goal, "cancelled")
+    if (goal.status === "active") cancelGoalRecord(goal, "interrupted")
     return snapshot(goal)
   })
 }
@@ -1340,13 +1499,18 @@ export async function accountUsage(
     maybeStopForBudget(goal)
     goal.updatedAt = nowSeconds()
     return snapshot(goal)
-  })
+  }, (result) => result !== null)
+}
+
+function normalizedStallSummary(text: string) {
+  return text.toLowerCase().replace(/\b\d+\b/g, "#").replace(/\s+/g, " ").trim()
 }
 
 export async function recordAssistantProgress(sessionID: string, input: AssistantProgressInput) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal || goal.status !== "active") return goal ? snapshot(goal) : null
+    const waitingForShell = goal.shellDeferrals.some((item) => !item.delivered)
 
     const text = input.text?.trim() ?? ""
     const messageID = input.messageID?.trim() ?? ""
@@ -1366,7 +1530,7 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
     // Substantive assistant text proves the continuation transport is healthy,
     // so a pending continuation is resolved and any accumulated prompt failures
     // are cleared. Delivery of a prompt alone never resets the counter.
-    if (substantive && summary && (!repeatedMessage || changed)) {
+    if (!waitingForShell && substantive && summary && (!repeatedMessage || changed)) {
       // Correlate the progress to the current attempt: delayed output that
       // completed before this attempt was reserved belongs to a prior turn and
       // must not clear a newer pending attempt. Guarded by the attempt's
@@ -1384,6 +1548,7 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
     // record checkpoints above but never touch the counter.
     const attemptForCompletion = goal.pendingAttempt
     const continuationTurnCompleted =
+      !waitingForShell &&
       input.evaluateContinuation === true &&
       goal.awaitingContinuationProgress &&
       Boolean(messageID) &&
@@ -1396,7 +1561,9 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
       goal.pendingAttempt = null
       const lowOutput = outputTokens > 0 && outputTokens < (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD)
       const changedSinceContinuation = Boolean(summary && summary !== goal.continuationBaselineSummary)
-      if (lowOutput && !changedSinceContinuation) {
+      const repeatedWithoutTools = goal.continuationToolCalls === 0 && Boolean(summary) &&
+        normalizedStallSummary(summary) === normalizedStallSummary(goal.continuationBaselineSummary)
+      if (goal.continuationToolCalls === 0 && ((lowOutput && !changedSinceContinuation) || repeatedWithoutTools)) {
         goal.noProgressTurns += 1
         if (maxNoProgressTurns && goal.noProgressTurns >= maxNoProgressTurns) {
           accountWallClock(goal)
@@ -1431,6 +1598,7 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) return null
+    if (goal.status === "active" && goal.shellDeferrals.some((item) => !item.delivered)) return null
     if (goal.status === "budgetLimited" || goal.status === "usageLimited") return reserveWrapup(goal)
     if (!canContinue(goal.status)) return null
     const now = nowSeconds()
@@ -1453,6 +1621,7 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
     // continuation prompt was actually delivered.
     goal.continuationBaselineMessageID = goal.lastAssistantMessageID
     goal.continuationBaselineSummary = summarizeText(goal.lastAssistantText)
+    goal.continuationToolCalls = 0
     goal.pendingAttempt = {
       id: randomId(),
       reservedAt: Date.now(),
@@ -1513,13 +1682,19 @@ export async function recordContinuationResult(
     requirePending?: boolean
     expectedGoalID?: string
     expectedAttemptID?: string
+    expectedAutoTurns?: number
   },
 ) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal || isClosed(goal.status)) return goal ? snapshotInternal(goal) : null
     if (options?.expectedGoalID && goal.id !== options.expectedGoalID) return null
-    if (options?.expectedAttemptID && goal.pendingAttempt?.id !== options.expectedAttemptID) return null
+    if (options?.expectedAutoTurns != null && goal.autoTurns !== options.expectedAutoTurns) return null
+    if (options?.expectedAttemptID && goal.pendingAttempt?.id !== options.expectedAttemptID) {
+      // Progress may consume a reservation before its accepted send resolves.
+      // Recreate delivery tracking only if no later turn has been reserved.
+      if (result !== "success" || goal.pendingAttempt != null || options.expectedAutoTurns == null) return null
+    }
     const now = nowSeconds()
     goal.updatedAt = now
     if (result === "success") {
@@ -1605,10 +1780,17 @@ export async function markPendingContinuationStarted(sessionID: string) {
  * earlier turn can never clear a newer pending attempt. Omitting the argument
  * keeps the legacy unconditional reset for direct callers.
  */
-export async function recordToolProgress(sessionID: string, text?: string, expectedAttemptID?: string | null) {
+export async function recordToolProgress(sessionID: string, text?: string, expectedAttemptID?: string | null, substantiveTool = true) {
+  let changed = false
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal || goal.status !== "active") return goal ? snapshotInternal(goal) : null
+    if (substantiveTool && goal.awaitingContinuationProgress &&
+      (goal.pendingAttempt == null || expectedAttemptID === undefined || expectedAttemptID === goal.pendingAttempt.id)) {
+      goal.continuationToolCalls += 1
+      goal.updatedAt = nowSeconds()
+      changed = true
+    }
     const value = text?.trim() ?? ""
     if (!value) return snapshotInternal(goal)
     if (goal.continuationFailures === 0 && goal.pendingAttempt == null) return snapshotInternal(goal)
@@ -1628,8 +1810,9 @@ export async function recordToolProgress(sessionID: string, text?: string, expec
     goal.continuationFailures = 0
     goal.pendingAttempt = null
     goal.updatedAt = nowSeconds()
+    changed = true
     return snapshotInternal(goal)
-  })
+  }, () => changed)
 }
 
 function reserveWrapup(goal: Goal): InternalGoalSnapshot | null {
