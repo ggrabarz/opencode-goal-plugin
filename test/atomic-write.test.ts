@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test"
 import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
+import { z } from "zod"
 import {
   OPEN_ATTEMPTS,
   RENAME_ATTEMPTS,
@@ -11,7 +12,6 @@ import {
   defaultAtomicWriteOps,
   defaultDirOpenOps,
   defaultSleep,
-  renameRetryDelayMs,
   syncDirectory,
 } from "../src/atomic-write"
 import type { AtomicWriteOps, DirHandleOps, DirOpenOps, FileHandleOps } from "../src/atomic-write"
@@ -553,7 +553,7 @@ test("rename retry exhaustion fails, preserves the old file, and cleans the temp
     "unlink",
   ])
   // Backoff doubles per attempt and then stays capped.
-  const delays = allArgsFor("sleep").map((args) => args[0] as number)
+  const delays = z.array(z.number()).parse(allArgsFor("sleep").map(([delay]) => delay))
   expect(delays).toHaveLength(RENAME_ATTEMPTS - 1)
   expect(delays[0]).toBe(RENAME_RETRY_DELAY_MS)
   expect(delays[1]).toBe(RENAME_RETRY_DELAY_MS * 2)
@@ -591,8 +591,7 @@ test("rename survives a Windows lock that outlives the old three-attempt budget"
 })
 
 test("the rename retry backoff stays inside a bounded total wait", async () => {
-  // A target that stays locked must not block the caller forever: the whole
-  // retry budget is capped well below any host-level request timeout.
+  // Check the stated backoff budget independently of its implementation.
   const { ops, allArgsFor } = makeRecordingOps({
     ops: {
       platform: "win32",
@@ -604,11 +603,10 @@ test("the rename retry backoff stays inside a bounded total wait", async () => {
 
   await expect(atomicWriteFile(file, DATA, ops)).rejects.toThrow("EBUSY: target busy")
 
-  const delays = allArgsFor("sleep").map((args) => args[0] as number)
+  const delays = z.array(z.number()).parse(allArgsFor("sleep").map(([delay]) => delay))
   const total = delays.reduce((sum, delay) => sum + delay, 0)
-  expect(total).toBeGreaterThanOrEqual(RENAME_RETRY_DELAY_MS)
-  expect(total).toBeLessThanOrEqual(RENAME_RETRY_MAX_DELAY_MS * (RENAME_ATTEMPTS - 1))
-  expect(delays).toEqual(delays.map((_, index) => renameRetryDelayMs(index + 1)))
+  expect(delays).toEqual([20, 40, 80, 160, 320, 500, 500, 500, 500])
+  expect(total).toBe(2620)
 })
 
 test("a non-transient rename error is never retried", async () => {
