@@ -4520,3 +4520,90 @@ for (const control of ["stop_goal", "clear_goal", "pause_tool", "pause_objective
     }
   }, 10_000)
 }
+
+for (const control of ["stop_goal", "clear_goal", "pause_tool", "pause_objective"]) {
+  test(`V1 ${control} prevents a stale busy read from rearming the watchdog`, async () => {
+    const calls: unknown[] = []
+    const releasePrompt = Promise.withResolvers<void>()
+    const hooks = await setupServer(
+      { client: { session: { promptAsync: async (input: unknown) => { calls.push(input); await releasePrompt.promise } } } } as never,
+      { auto_continue: false, max_turn_time: 0.03 },
+    )
+    const sessionID = "ses_stale_busy"
+    const context = { sessionID, agent: "build" } as never
+    await requireTool(hooks.tool?.create_goal, "create_goal").execute({ objective: "stop the pending busy handler" }, context)
+    const held = Promise.withResolvers<void>()
+    const released = Promise.withResolvers<void>()
+    const owner = withStateLock(process.env.OPENCODE_GOAL_STATE_PATH!, async () => {
+      held.resolve()
+      await released.promise
+    })
+    const gate = holdNextStateRead(process.env.OPENCODE_GOAL_STATE_PATH!)
+    let started: Promise<unknown> | undefined
+    let stopping: Promise<unknown> | undefined
+    let stopped = false
+    try {
+      await held.promise
+      started = hooks.event!({ event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } } as never)
+      await Promise.race([gate.captured, Bun.sleep(1_000).then(() => { throw new Error("busy state read was not intercepted") })])
+      stopping = requireTool(hooks.tool?.[control === "pause_tool" ? "update_goal_status" : control === "pause_objective" ? "update_goal_objective" : control], control).execute(
+        control === "pause_objective" ? { objective: "paused objective", status: "paused" } : control === "pause_tool" ? { status: "paused" } : {}, context,
+      ).then((result) => { stopped = true; return result })
+      gate.release()
+      await started
+      await Bun.sleep(150)
+      expect(stopped).toBe(false)
+      expect((await getGoal(sessionID))?.status).toBe("active")
+      expect(calls).toHaveLength(0)
+    } finally {
+      gate.restore()
+      released.resolve()
+      await owner
+      await started
+      await stopping
+      await hooks.dispose?.()
+      releasePrompt.resolve()
+      await Bun.sleep(0)
+    }
+  }, 10_000)
+}
+
+for (const rejectedPause of ["planned_objective", "oversized_blocker"]) {
+  test(`V1 rejected ${rejectedPause} pause preserves the active watchdog`, async () => {
+    const calls: unknown[] = []
+    const hooks = await setupServer(
+      { client: { session: { promptAsync: async (input: unknown) => { calls.push(input) } } } } as never,
+      { auto_continue: false, max_turn_time: 0.05 },
+    )
+    const sessionID = "ses_rejected_pause"
+    const context = { sessionID, agent: "build" } as never
+    await requireTool(hooks.tool?.create_goal, "create_goal").execute({ objective: "preserve the original active goal" }, context)
+    const goal = (await getGoal(sessionID))!
+    if (rejectedPause === "planned_objective") {
+      await requireTool(hooks.tool?.update_goal_plan, "update_goal_plan").execute({
+        goal_id: goal.id,
+        expected_revision: 0,
+        reason: "Preserve the agreed scope",
+        plan: {
+          summary: "Full scope",
+          completionCriteria: ["Parser and execution verified"],
+          phases: [{ id: "parser", objective: "Parser", status: "pending", tasks: [{ id: "parse", description: "Parse", status: "pending" }] }],
+        },
+      }, context)
+    }
+    const original = await getGoal(sessionID)
+    await hooks.event!({ event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } } as never)
+    try {
+      const pause = rejectedPause === "planned_objective"
+        ? requireTool(hooks.tool?.update_goal_objective, "update_goal_objective").execute({ objective: "Only parser", status: "paused" }, context)
+        : requireTool(hooks.tool?.update_goal_status, "update_goal_status").execute({ status: "paused", reason: "awaiting_user", blocker: "x".repeat(100_001) }, context)
+      await expect(pause).rejects.toThrow(rejectedPause === "planned_objective" ? "/goal edit" : "awaiting-user blocker must be at most")
+      expect(await getGoal(sessionID)).toMatchObject({ id: goal.id, objective: goal.objective, status: "active", plan: original?.plan })
+      await waitForContinuation(calls, 1_000)
+      await waitForLong(async () => (await getGoalInternal(sessionID))?.pendingAttempt?.delivered === true)
+      expect((await getGoal(sessionID))?.status).toBe("active")
+    } finally {
+      await hooks.dispose?.()
+    }
+  }, 10_000)
+}

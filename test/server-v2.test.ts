@@ -3784,3 +3784,87 @@ test("V2 rejects an invalid objective pause without suppressing the active watch
     await cleanup()
   }
 })
+
+for (const control of ["stop_goal", "clear_goal", "pause_tool", "pause_objective"]) {
+  test(`V2 ${control} prevents a stale busy read from rearming the watchdog`, async () => {
+    const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.03 })
+    const releasePrompt = Promise.withResolvers<void>()
+    mock.session.prompt = async (input) => {
+      mock.promptCalls.push(input)
+      await releasePrompt.promise
+      return { id: "pending_stale_busy" }
+    }
+    const cleanup = await setupPlugin(mock as never)
+    await createGoalViaV2Tool(mock, "stop the pending busy handler")
+    const held = Promise.withResolvers<void>()
+    const released = Promise.withResolvers<void>()
+    const owner = withStateLock(process.env.OPENCODE_GOAL_STATE_PATH!, async () => {
+      held.resolve()
+      await released.promise
+    })
+    const gate = holdNextStateRead(process.env.OPENCODE_GOAL_STATE_PATH!)
+    let started: Promise<void> | undefined
+    let stopping: Promise<unknown> | undefined
+    let stopped = false
+    try {
+      await held.promise
+      started = mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
+      await Promise.race([gate.captured, Bun.sleep(1_000).then(() => { throw new Error("busy state read was not intercepted") })])
+      stopping = goalTool(mock, control === "pause_tool" ? "update_goal_status" : control === "pause_objective" ? "update_goal_objective" : control).execute(
+        control === "pause_objective" ? { objective: "paused objective", status: "paused" } : control === "pause_tool" ? { status: "paused" } : {}, toolContext(),
+      ).then((result) => { stopped = true; return result })
+      gate.release()
+      await started
+      await Bun.sleep(150)
+      expect(stopped).toBe(false)
+      expect((await getGoal("ses_v2"))?.status).toBe("active")
+      expect(mock.promptCalls).toHaveLength(0)
+    } finally {
+      gate.restore()
+      released.resolve()
+      await owner
+      await started
+      await stopping
+      mock.stream.end()
+      await cleanup()
+      releasePrompt.resolve()
+      await Bun.sleep(0)
+    }
+  }, 10_000)
+}
+
+for (const rejectedPause of ["planned_objective", "oversized_blocker"]) {
+  test(`V2 rejected ${rejectedPause} pause preserves the active watchdog`, async () => {
+    const mock = makeMockContext({ auto_continue: false, max_turn_time: 0.05 })
+    const cleanup = await setupPlugin(mock as never)
+    await createGoalViaV2Tool(mock, "preserve the original active goal")
+    const goal = (await getGoal("ses_v2"))!
+    if (rejectedPause === "planned_objective") {
+      await goalTool(mock, "update_goal_plan").execute({
+        goal_id: goal.id,
+        expected_revision: 0,
+        reason: "Preserve the agreed scope",
+        plan: {
+          summary: "Full scope",
+          completionCriteria: ["Parser and execution verified"],
+          phases: [{ id: "parser", objective: "Parser", status: "pending", tasks: [{ id: "parse", description: "Parse", status: "pending" }] }],
+        },
+      }, toolContext())
+    }
+    const original = await getGoal("ses_v2")
+    await mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
+    try {
+      const pause = rejectedPause === "planned_objective"
+        ? goalTool(mock, "update_goal_objective").execute({ objective: "Only parser", status: "paused" }, toolContext())
+        : goalTool(mock, "update_goal_status").execute({ status: "paused", reason: "awaiting_user", blocker: "x".repeat(100_001) }, toolContext())
+      await expect(pause).rejects.toThrow(rejectedPause === "planned_objective" ? "/goal edit" : "awaiting-user blocker must be at most")
+      expect(await getGoal("ses_v2")).toMatchObject({ id: goal.id, objective: goal.objective, status: "active", plan: original?.plan })
+      await waitFor(() => mock.promptCalls.length === 1, 1_000)
+      await waitFor(async () => (await getGoalInternal("ses_v2"))?.pendingAttempt?.delivered === true)
+      expect((await getGoal("ses_v2"))?.status).toBe("active")
+    } finally {
+      mock.stream.end()
+      await cleanup()
+    }
+  }, 10_000)
+}
