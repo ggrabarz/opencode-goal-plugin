@@ -4607,3 +4607,127 @@ for (const rejectedPause of ["planned_objective", "oversized_blocker"]) {
     }
   }, 10_000)
 }
+
+for (const wakeup of ["watchdog", "scheduled recovery", "disposed watchdog"]) {
+  test(wakeup === "disposed watchdog"
+    ? "V1 disposing during a pending pause prevents sends after its rejection"
+    : `V1 a delayed rejected pause preserves the ${wakeup}`, async () => {
+    const calls: unknown[] = []
+    const hooks = await setupServer(
+      { client: { session: { promptAsync: async (input: unknown) => { calls.push(input) } } } } as never,
+      { auto_continue: wakeup === "scheduled recovery", max_turn_time: 0.03, min_continue_interval_seconds: 0 },
+    )
+    const sessionID = "ses_delayed_rejection"
+    const context = { sessionID, agent: "build" } as never
+    await requireTool(hooks.tool?.create_goal, "create_goal").execute({ objective: "preserve the agreed full scope" }, context)
+    const goal = (await getGoal(sessionID))!
+    await requireTool(hooks.tool?.update_goal_plan, "update_goal_plan").execute({
+      goal_id: goal.id,
+      expected_revision: 0,
+      reason: "Preserve the agreed scope",
+      plan: {
+        summary: "Full scope",
+        completionCriteria: ["Parser and execution verified"],
+        phases: [{ id: "parser", objective: "Parser", status: "pending", tasks: [{ id: "parse", description: "Parse", status: "pending" }] }],
+      },
+    }, context)
+    await hooks.event!({ event: wakeup === "scheduled recovery"
+      ? { type: "session.error", properties: { sessionID, error: { message: "network connection failed" } } }
+      : { type: "session.status", properties: { sessionID, status: { type: "busy" } } },
+    } as never)
+    const gate = holdNextStateRead(process.env.OPENCODE_GOAL_STATE_PATH!)
+    const held = Promise.withResolvers<void>()
+    const released = Promise.withResolvers<void>()
+    const owner = withStateLock(process.env.OPENCODE_GOAL_STATE_PATH!, async () => {
+      held.resolve()
+      await released.promise
+    })
+    let rejected: Promise<unknown> | undefined
+    let settled = false
+    try {
+      await held.promise
+      rejected = requireTool(hooks.tool?.update_goal_objective, "update_goal_objective").execute({ objective: "Only parser", status: "paused" }, context)
+        .then(() => { settled = true; return null }, (error: unknown) => { settled = true; return error })
+      gate.release()
+      await Bun.sleep(150)
+      expect(settled).toBe(false)
+      expect(calls).toHaveLength(0)
+      if (wakeup === "disposed watchdog") {
+        await Promise.race([hooks.dispose?.(), Bun.sleep(1_000).then(() => { throw new Error("dispose waited for the pause verdict") })])
+      }
+      released.resolve()
+      await owner
+      const error = await rejected
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toContain("/goal edit")
+      expect(await getGoal(sessionID)).toMatchObject({ id: goal.id, objective: goal.objective, status: "active", planRevision: 1 })
+      if (wakeup === "disposed watchdog") {
+        await Bun.sleep(150)
+        expect(calls).toHaveLength(0)
+        expect((await getGoalInternal(sessionID))?.pendingAttempt).toBeNull()
+      } else {
+        await waitForContinuation(calls, 1_000)
+        await waitForLong(async () => (await getGoalInternal(sessionID))?.pendingAttempt?.delivered === true)
+      }
+    } finally {
+      gate.restore()
+      released.resolve()
+      await owner
+      await rejected
+      await hooks.dispose?.()
+    }
+  }, 10_000)
+}
+
+for (const pauseKind of ["Plan mode", "overlapping rejected blocker"]) {
+  test(`V1 ${pauseKind} pause suppresses the watchdog until its verdict`, async () => {
+    const calls: unknown[] = []
+    const releasePrompt = Promise.withResolvers<void>()
+    const hooks = await setupServer(
+      { client: { session: { promptAsync: async (input: unknown) => { calls.push(input); await releasePrompt.promise } } } } as never,
+      { auto_continue: false, max_turn_time: 0.03 },
+    )
+    const sessionID = "ses_pending_pause"
+    const context = { sessionID, agent: "build" } as never
+    await requireTool(hooks.tool?.create_goal, "create_goal").execute({ objective: "preserve the goal until paused" }, context)
+    const held = Promise.withResolvers<void>()
+    const released = Promise.withResolvers<void>()
+    const owner = withStateLock(process.env.OPENCODE_GOAL_STATE_PATH!, async () => {
+      held.resolve()
+      await released.promise
+    })
+    let pausing: Promise<unknown> | undefined
+    let paused = false
+    try {
+      await held.promise
+      await hooks.event!({ event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } } as never)
+      pausing = requireTool(hooks.tool?.update_goal_objective, "update_goal_objective").execute(
+        { objective: "preserve the goal until paused", status: pauseKind === "Plan mode" ? "active" : "paused" },
+        { sessionID, agent: pauseKind === "Plan mode" ? "plan" : "build" } as never,
+      ).then((result) => { paused = true; return result })
+      if (pauseKind === "overlapping rejected blocker") {
+        await expect(requireTool(hooks.tool?.update_goal_status, "update_goal_status").execute(
+          { status: "paused", reason: "awaiting_user", blocker: "x".repeat(100_001) }, context,
+        )).rejects.toThrow("awaiting-user blocker must be at most")
+      }
+      await Bun.sleep(150)
+      expect(paused).toBe(false)
+      expect((await getGoal(sessionID))?.status).toBe("active")
+      const promptsWhilePending = calls.length
+      released.resolve()
+      await owner
+      await pausing
+      expect(promptsWhilePending).toBe(0)
+      expect((await getGoal(sessionID))?.status).toBe("paused")
+      await Bun.sleep(50)
+      expect(calls).toHaveLength(0)
+    } finally {
+      released.resolve()
+      await owner
+      await pausing
+      await hooks.dispose?.()
+      releasePrompt.resolve()
+      await Bun.sleep(0)
+    }
+  }, 10_000)
+}
