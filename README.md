@@ -8,6 +8,8 @@ OpenCode Goal Plugin adds Codex-style long-running goal mode to OpenCode. It giv
 
 If you are searching for an OpenCode goal plugin, goal mode for OpenCode, or a way to keep an OpenCode AI coding agent focused on a long-running task, this package is the npm plugin for that workflow.
 
+Also check out [OpenCode Loop Plugin](https://github.com/prevalentWare/opencode-loop-plugin), which works well alongside Goal. Goal keeps the agent focused on an objective; Loop adds recurring checks for things that change over time, such as CI results, deployments, and PR reviews.
+
 Links:
 
 - npm package: [`@prevalentware/opencode-goal-plugin`](https://www.npmjs.com/package/@prevalentware/opencode-goal-plugin)
