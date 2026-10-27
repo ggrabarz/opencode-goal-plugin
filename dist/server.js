@@ -4627,12 +4627,17 @@ async function setupV2(context) {
         stoppedExecutions.add(sessionID);
     }
   };
+  let autonomyAvailable = true;
   const registrations = [];
-  async function registerSafely(what, register) {
+  async function registerSafely(what, register, requiredForAutonomy = false) {
     try {
       registrations.push(await register());
+      return true;
     } catch (error) {
-      v2ErrorLog(`Failed to register ${what}`, error);
+      if (requiredForAutonomy)
+        autonomyAvailable = false;
+      v2ErrorLog(`Failed to register ${what}${requiredForAutonomy ? "; autonomous continuation disabled" : ""}`, error);
+      return false;
     }
   }
   let disposed = false;
@@ -4679,11 +4684,11 @@ async function setupV2(context) {
   }
   async function runTurnWatchdog(sessionID, watchdog) {
     const epoch = continuationEpochs.current(sessionID);
-    const isCurrent = () => !disposed && epoch === continuationEpochs.current(sessionID);
+    const isCurrent = () => !disposed && autonomyAvailable && epoch === continuationEpochs.current(sessionID);
     let claimedContinuation = false;
     let claimedGoalID;
     try {
-      if (disposed)
+      if (disposed || !autonomyAvailable)
         return;
       await taskRecoveryComplete;
       if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID) || watchdogRescuedSessions.has(sessionID))
@@ -4795,7 +4800,7 @@ async function setupV2(context) {
     scheduleSettledContinuation(sessionID, TASK_BLOCK_RETRY_MS, scheduled != null, scheduled?.purpose ?? "settle");
   }
   async function runAutoContinue(sessionID, fromTaskDeferral = false, scheduled) {
-    if (disposed)
+    if (disposed || !autonomyAvailable)
       return;
     if (stoppedExecutions.has(sessionID))
       return;
@@ -4808,7 +4813,7 @@ async function setupV2(context) {
       return;
     }
     const epoch = continuationEpochs.current(sessionID);
-    const isCurrent = () => !disposed && epoch === continuationEpochs.current(sessionID);
+    const isCurrent = () => !disposed && autonomyAvailable && epoch === continuationEpochs.current(sessionID);
     await taskRecoveryComplete;
     if (!isCurrent() || stoppedExecutions.has(sessionID))
       return;
@@ -5448,7 +5453,7 @@ async function setupV2(context) {
                   if (eventConsumerStopped)
                     throw new Error("goal event stream stopped");
                   const goal = await getGoal(input.sessionID);
-                  if (signal.aborted || disposed || stoppedExecutions.has(input.sessionID) || !autoContinue || goal?.status !== "active")
+                  if (signal.aborted || disposed || stoppedExecutions.has(input.sessionID) || !autoContinue || !autonomyAvailable || goal?.status !== "active")
                     break;
                   pursuedGoalID ??= goal.id;
                   if (goal.id !== pursuedGoalID)
@@ -5501,7 +5506,7 @@ async function setupV2(context) {
       if (isExplicitResumePrompt(input.prompt.text, commandName, locale, messages)) {
         explicitResumeRequests.add(input.sessionID);
       }
-    }));
+    }), true);
   }
   try {
     const hookInterrupt = context.session.hook;
@@ -5518,8 +5523,11 @@ async function setupV2(context) {
   await registerSafely("the goal tools", () => context.tool.transform((draft) => {
     for (const tool of goalToolsV2(goalServices))
       draft.add(tool);
-  }));
-  await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", async (input) => {
+  }), true);
+  let tracksToolEnds = false;
+  const tracksToolStarts = await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", async (input) => {
+    if (!tracksToolEnds)
+      return;
     taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id });
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
     if (sessionID)
@@ -5529,8 +5537,8 @@ async function setupV2(context) {
       const goal = await getGoalInternal(sessionID);
       toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
     }
-  }));
-  await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", async (input) => {
+  }), true);
+  tracksToolEnds = await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", async (input) => {
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
     const callID = typeof input.id === "string" ? input.id : undefined;
     const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined;
@@ -5554,7 +5562,7 @@ async function setupV2(context) {
     }
     const text2 = textFromToolResult(input.result);
     taskTracker.noteTaskOutput({ tool: input.tool, sessionID: input.sessionID, callID: input.id }, { output: textFromToolResult(input.result) });
-    if (!sessionID || typeof input.tool !== "string")
+    if (!tracksToolStarts || !sessionID || typeof input.tool !== "string")
       return;
     if (NON_PROGRESS_TOOLS.has(input.tool.toLowerCase()))
       return;
@@ -5569,7 +5577,7 @@ async function setupV2(context) {
       locallyDeliveredPendingSessions.delete(sessionID);
       cancelScheduledContinuation(sessionID);
     }
-  }));
+  }), true);
   const reminder = systemReminder(locale, true);
   const ensureSystemReminder = (system) => {
     if (system.some((part) => part.type === "text" && part.text.includes(reminder)))
@@ -5578,7 +5586,7 @@ async function setupV2(context) {
   };
   await registerSafely("the context hook", () => context.session.hook("context", (sessionContext) => {
     ensureSystemReminder(sessionContext.system);
-  }));
+  }), true);
   try {
     const hookCompaction = context.session.hook;
     await registerSafely("the compaction hook", () => hookCompaction("compaction", async (event) => {
@@ -5618,10 +5626,10 @@ async function setupV2(context) {
   const abortController = new AbortController;
   let eventIterator;
   const consumer = (async () => {
-    const subscription = context.event.subscribe({ signal: abortController.signal });
-    const iterator = subscription[Symbol.asyncIterator]();
-    eventIterator = iterator;
     try {
+      const subscription = context.event.subscribe({ signal: abortController.signal });
+      const iterator = subscription[Symbol.asyncIterator]();
+      eventIterator = iterator;
       while (true) {
         const { done, value } = await iterator.next();
         if (done)
@@ -5634,8 +5642,16 @@ async function setupV2(context) {
       if (!abortController.signal.aborted)
         v2ErrorLog("V2 event consumer stopped", error);
     } finally {
-      if (!disposed && !abortController.signal.aborted)
+      if (!disposed && !abortController.signal.aborted) {
         eventConsumerStopped = true;
+        autonomyAvailable = false;
+        for (const scheduled of scheduledContinuations.values())
+          clearTimeout(scheduled.timer);
+        scheduledContinuations.clear();
+        for (const watchdog of turnWatchdogs.values())
+          clearTimeout(watchdog.timer);
+        turnWatchdogs.clear();
+      }
     }
   })();
   return async () => {
@@ -5655,8 +5671,13 @@ async function setupV2(context) {
     toolAttempts.clear();
     explicitResumeRequests.clear();
     objectiveEdits.clear();
-    for (const registration of registrations)
-      await registration.dispose();
+    for (const registration of registrations) {
+      try {
+        await registration.dispose();
+      } catch (error) {
+        v2ErrorLog("Failed to dispose a goal registration", error);
+      }
+    }
     const termination = Promise.allSettled([consumer, eventIterator?.return?.()]);
     await Promise.race([termination, new Promise((resolve) => setTimeout(resolve, 2000))]);
   };

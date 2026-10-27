@@ -3300,7 +3300,7 @@ test("V2 a command transport abort preserves the active goal for reconnection", 
   expect((await getGoal("ses_v2"))?.status).toBe("active")
 })
 
-test("V2 a failing registration does not remove the plugin", async () => {
+test("V2 a failing command list does not remove the plugin", async () => {
   // A plugin that fails to register takes the whole location with it:
   // OpenCode reports "Location plugins did not finish activating" and every
   // command that needs the location fails. A single failing registration must
@@ -3327,5 +3327,124 @@ test("V2 a failing registration does not remove the plugin", async () => {
   expect(commands).toContain("goal")
 
   mock.stream.end()
+  await cleanup()
+})
+
+for (const hook of ["prompt", "context", "tools", "execute.before", "execute.after"]) {
+  test(`V2 missing ${hook} registration disables autonomous continuation`, async () => {
+    const mock = makeMockContext({ min_continue_interval_seconds: 0, max_turn_time: 0.02 })
+    const fail = () => { throw new Error(`refused ${hook}`) }
+    if (hook === "tools") mock.tool.transform = fail
+    else if (hook.startsWith("execute.")) {
+      const register = mock.tool.hook
+      mock.tool.hook = (name, callback) => name === hook ? fail() : register(name, callback)
+    } else {
+      const register = mock.session.hook
+      mock.session.hook = (name, callback) => name === hook ? fail() : register(name, callback)
+    }
+    const cleanup = await setupPlugin(mock as never)
+    await createGoal("ses_v2", "Manual goal remains available")
+    await mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    await mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(mock.promptCalls).toHaveLength(0)
+    expect((await getGoal("ses_v2"))?.autoTurns).toBe(0)
+    expect(await readFile(join(dir, "goal-plugin.log"), "utf8")).toContain(`refused ${hook}`)
+    mock.stream.end()
+    await cleanup()
+  })
+}
+
+test("V2 missing tool-start registration preserves a newer pending attempt", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const register = mock.tool.hook
+  mock.tool.hook = async (name, callback) => {
+    if (name === "execute.before") throw new Error("refused tool start")
+    return register(name, callback)
+  }
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "Preserve unrelated pending work")
+  const reserved = await reserveContinuation("ses_v2", 10, 0)
+  expect(reserved?.pendingAttempt?.id).toBeTypeOf("string")
+  await mock.hooks["execute.after"]!({
+    tool: "read", sessionID: "ses_v2", id: "old_tool", status: "completed",
+    result: { output: "Output from an untracked older tool" },
+  })
+  expect((await getGoalInternal("ses_v2"))?.pendingAttempt?.id).toBe(reserved?.pendingAttempt?.id)
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 a subscription startup failure is reported and cleanup completes", async () => {
+  const mock = makeMockContext()
+  mock.event.subscribe = () => { throw new Error("subscription startup sentinel") }
+  const cleanup = await setupPlugin(mock as never)
+  expect(await readFile(join(dir, "goal-plugin.log"), "utf8")).toContain("subscription startup sentinel")
+  await createGoal("ses_v2", "Leave the failed location loop safely")
+  await mock.commands.find((command) => command.name === "goal")!.execute({
+    sessionID: "ses_v2", prompt: { text: "resume" }, delivery: "steer",
+  })
+  expect((await getGoal("ses_v2"))?.status).toBe("paused")
+  expect(mock.promptCalls).toHaveLength(1)
+  await cleanup()
+  expect(mock.disposals).toContain("tool.transform")
+  expect(mock.disposals).toContain("session.hook:context")
+})
+
+test("V2 one failed disposer does not skip the remaining registrations", async () => {
+  const mock = makeMockContext()
+  const register = mock.command.transform
+  mock.command.transform = async (callback) => {
+    const registration = await register(callback)
+    return { dispose: async () => { await registration.dispose(); throw new Error("disposal sentinel") } }
+  }
+  const cleanup = await setupPlugin(mock as never)
+  mock.stream.end()
+  await cleanup()
+  expect(mock.disposals).toContain("tool.transform")
+  expect(mock.disposals).toContain("session.hook:compaction")
+  expect(await readFile(join(dir, "goal-plugin.log"), "utf8")).toContain("disposal sentinel")
+})
+
+
+for (const target of ["command", "tools", "execute.before", "execute.after", "prompt", "context", "interrupt", "compaction"]) {
+  for (const synchronous of [true, false]) {
+    test(`V2 registration ${target} contains ${synchronous ? "throws" : "rejections"} and cleans up survivors`, async () => {
+      const mock = makeMockContext({ auto_continue: false })
+      const fail = () => {
+        const error = new Error(`registration sentinel ${target}`)
+        if (synchronous) throw error
+        return Promise.reject(error)
+      }
+      if (target === "command") mock.command.transform = fail
+      else if (target === "tools") mock.tool.transform = fail
+      else if (target.startsWith("execute.")) {
+        const register = mock.tool.hook
+        mock.tool.hook = (name, callback) => name === target ? fail() : register(name, callback)
+      } else {
+        const register = mock.session.hook
+        mock.session.hook = (name, callback) => name === target ? fail() : register(name, callback)
+      }
+      const cleanup = await setupPlugin(mock as never)
+      if (target !== "tools") expect(mock.tools.map((tool) => tool.name)).toContain("get_goal")
+      if (target !== "command") expect(mock.commands.map((command) => command.name)).toContain("goal")
+      expect(await readFile(join(dir, "goal-plugin.log"), "utf8")).toContain(`registration sentinel ${target}`)
+      mock.stream.end()
+      await cleanup()
+      expect(mock.disposals).toHaveLength(7)
+    })
+  }
+}
+
+
+test("V2 an unexpected event stream exit cancels an armed watchdog", async () => {
+  const mock = makeMockContext({ max_turn_time: 0.05, min_continue_interval_seconds: 0 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "Stop automatic work when observation ends")
+  await mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
+  mock.stream.end()
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  expect(mock.promptCalls).toHaveLength(0)
   await cleanup()
 })
