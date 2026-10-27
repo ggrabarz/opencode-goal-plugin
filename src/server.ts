@@ -147,17 +147,73 @@ type ScheduledContinuation = {
   purpose: "settle" | "recovery" | "retry"
 }
 
+type ContinuationControl = {
+  epoch: number
+  pending: number
+  changed?: { promise: Promise<void>; resolve: () => void }
+}
+
 // Invalidate work already awaiting transcript/state IO when its goal is stopped
 // or replaced. A fresh busy event must not make an older callback current again.
 class ContinuationEpochs {
-  private readonly values = new Map<string, number>()
+  private readonly sessions = new Map<string, ContinuationControl>()
+  private disposed = false
+
+  private control(sessionID: string) {
+    let control = this.sessions.get(sessionID)
+    if (!control) {
+      control = { epoch: 0, pending: 0 }
+      this.sessions.set(sessionID, control)
+    }
+    return control
+  }
+
+  private wake(control: ContinuationControl) {
+    control.changed?.resolve()
+    control.changed = undefined
+  }
 
   current(sessionID: string) {
-    return this.values.get(sessionID) ?? 0
+    return this.sessions.get(sessionID)?.epoch ?? 0
   }
 
   invalidate(sessionID: string) {
-    this.values.set(sessionID, this.current(sessionID) + 1)
+    const control = this.control(sessionID)
+    control.epoch++
+    this.wake(control)
+  }
+
+  async decidePause<T>(sessionID: string, mutate: () => Promise<T>, commitStop: () => void): Promise<T> {
+    const control = this.control(sessionID)
+    control.pending++
+    try {
+      const result = await mutate()
+      if (!this.disposed) commitStop()
+      return result
+    } finally {
+      control.pending--
+      this.wake(control)
+    }
+  }
+
+  hasPending(sessionID: string) {
+    return (this.sessions.get(sessionID)?.pending ?? 0) > 0
+  }
+
+  async waitUntilSettled(sessionID: string, epoch: number) {
+    while (!this.disposed) {
+      const control = this.sessions.get(sessionID)
+      if ((control?.epoch ?? 0) !== epoch) return false
+      if (!control?.pending) return true
+      control.changed ??= Promise.withResolvers<void>()
+      await control.changed.promise
+    }
+    return false
+  }
+
+  dispose() {
+    this.disposed = true
+    for (const control of this.sessions.values()) this.wake(control)
   }
 }
 
@@ -1256,8 +1312,9 @@ type GoalServices = {
   maxObjectiveChars: number
   isPlanAgent: (agent: unknown) => boolean
   consumeExplicitResume: (sessionID: string) => boolean
+  decidePause: <T>(sessionID: string, mutate: () => Promise<T>) => Promise<T>
   initializeUsage?: (sessionID: string) => Promise<void>
-  stopAutonomy?: (sessionID: string, mode?: "stop" | "replace") => void
+  stopAutonomy: (sessionID: string, mode?: "stop" | "replace") => void
   consumeObjectiveEdit?: (sessionID: string, objective: string) => { goalID: string; objective: string } | undefined
   deferUntilShell?: (sessionID: string, shellID: string) => Promise<void>
 }
@@ -1408,13 +1465,14 @@ async function updateGoalObjectiveFromTool(
   const planningOnly = requested === "active" && services.isPlanAgent(context.agent)
   const edit = services.consumeObjectiveEdit?.(context.sessionID, input.objective)
   const objective = validateObjective(edit?.objective ?? input.objective, services.maxObjectiveChars)
-  if (requested === "paused") services.stopAutonomy?.(context.sessionID)
-  const goal = await updateGoalObjective(context.sessionID, objective, planningOnly ? "paused" : requested, {
+  const effectiveStatus = planningOnly ? "paused" : requested
+  const mutate = () => updateGoalObjective(context.sessionID, objective, effectiveStatus, {
     agent: typeof context.agent === "string" ? context.agent : null,
     planModePause: planningOnly,
     maxObjectiveChars: services.maxObjectiveChars,
     requestedPlanEdit: edit,
   })
+  const goal = effectiveStatus === "paused" ? await services.decidePause(context.sessionID, mutate) : await mutate()
   return JSON.stringify(planningOnly ? { goal, plan_mode_notice: services.messages.notices.planModeCreate } : { goal }, null, 2)
 }
 
@@ -1456,8 +1514,7 @@ async function updateGoalStatusFromTool(
   if (input.blocker && input.reason !== "awaiting_user") {
     throw new Error("blocker is only valid for an awaiting_user pause")
   }
-  if (input.status === "paused") services.stopAutonomy?.(context.sessionID)
-  const goal = await setGoalStatus(
+  const mutate = () => setGoalStatus(
     context.sessionID,
     input.status,
     typeof context.agent === "string" ? context.agent : null,
@@ -1468,6 +1525,7 @@ async function updateGoalStatusFromTool(
       awaitingUserBlocker: input.reason === "awaiting_user" ? input.blocker : undefined,
     },
   )
+  const goal = input.status === "paused" ? await services.decidePause(context.sessionID, mutate) : await mutate()
   return JSON.stringify({ goal }, null, 2)
 }
 
@@ -1590,6 +1648,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
     isPlanAgent,
     maxObjectiveChars: objectiveChars,
     consumeExplicitResume: (sessionID) => explicitResumeRequests.delete(sessionID),
+    decidePause: (sessionID, mutate) => continuationEpochs.decidePause(sessionID, mutate, () => goalServices.stopAutonomy(sessionID)),
     consumeObjectiveEdit: (sessionID, objective) => {
       const edit = objectiveEdits.get(sessionID)
       if (!edit || (edit.objective !== objective.trim() && escapeXmlText(edit.objective) !== objective.trim())) return
@@ -1678,25 +1737,28 @@ const server: Plugin = async ({ client }, options?: Options) => {
       // cannot later be mistaken for progress from the rescue prompt.
       const observedBeforeRescue = await recordAssistantMessage(sessionID, latestAssistant, options ?? {})
       await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observedBeforeRescue.goal)
-      const taskStatus = await taskBlockStatus(sessionID)
-      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
-      if (taskStatus && taskStatus.blocked) return
-      const current = await getGoal(sessionID)
-      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
-      if (current?.status !== "active" || isPlanAgent(current.lastPromptAgent) || activeContinuations.has(sessionID)) return
+      for (;;) {
+        if (!await continuationEpochs.waitUntilSettled(sessionID, epoch) || !isCurrent()) return
+        const deliveryAssistant = await fetchLatestAssistant(client, sessionID)
+        await taskBlockStatus(sessionID)
+        const current = await getGoalInternal(sessionID)
+        if (!isCurrent()) return
+        if (continuationEpochs.hasPending(sessionID)) continue
+        if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID) ||
+          nativeRetrySessions.has(sessionID) || watchdogRescuedSessions.has(sessionID) || activeContinuations.has(sessionID)) return
+        const deliveryAgent = agentFromMessage(deliveryAssistant)
+        if (current?.status !== "active" || isPlanAgent(current.lastPromptAgent) || isPlanAgent(deliveryAgent) ||
+          current.shellDeferrals.some((item) => !item.delivered) ||
+          (deferWhileTasksActive && taskTracker.hasBlockingTasks(sessionID, maxTaskBlockMs))) return
 
-      turnWatchdogs.delete(sessionID)
-      activeContinuations.add(sessionID)
-      claimedContinuation = true
-      claimedGoalID = current.id
-      watchdogRescuedSessions.add(sessionID)
-      if (!isCurrent()) return
-      await sendContinuation(
-        client,
-        sessionID,
-        continuationPrompt(current, locale),
-        current.lastPromptAgent ?? latestTurnAgent ?? null,
-      )
+        turnWatchdogs.delete(sessionID)
+        activeContinuations.add(sessionID)
+        claimedContinuation = true
+        claimedGoalID = current.id
+        watchdogRescuedSessions.add(sessionID)
+        await sendContinuation(client, sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? deliveryAgent ?? null)
+        break
+      }
       // Watchdog rescues are untracked retries: a delivered prompt arms the
       // pending-continuation window but never consumes an auto-turn budget and
       // never arms the no-progress evaluation. The rescue delivers while the
@@ -1954,23 +2016,48 @@ const server: Plugin = async ({ client }, options?: Options) => {
       attemptReservedAt = goal.pendingAttempt?.reservedAt ?? Date.now()
       attemptGoalID = goal.id
       attemptID = goal.pendingAttempt?.id
-      const beforeDelivery = await getGoalInternal(sessionID)
-      const busyBeforeDelivery = await scheduledSessionBusy(sessionID, scheduled)
-      if (!isCurrent() || !continuationStillReserved(goal, beforeDelivery) || busyBeforeDelivery || nativeRetrySessions.has(sessionID)) {
-        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
-        if (isCurrent() && busyBeforeDelivery) await rearmBusyContinuation(sessionID, scheduled)
-        return
+      for (;;) {
+        if (!await continuationEpochs.waitUntilSettled(sessionID, epoch) || !isCurrent()) {
+          await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
+          return
+        }
+        const deliveryAssistant = await fetchLatestAssistant(client, sessionID)
+        await taskBlockStatus(sessionID)
+        const busyBeforeDelivery = await scheduledSessionBusy(sessionID, scheduled)
+        const beforeDelivery = await getGoalInternal(sessionID)
+        if (!isCurrent()) {
+          await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
+          return
+        }
+        if (continuationEpochs.hasPending(sessionID)) continue
+        const deliveryAgent = agentFromMessage(deliveryAssistant)
+        const taskBlocked = deferWhileTasksActive && taskTracker.hasBlockingTasks(sessionID, maxTaskBlockMs)
+        const taskRetryAt = taskTracker.nextSnapshotIdleRetryAt(sessionID)
+        const busy = busyBeforeDelivery || busySessions.has(sessionID)
+        const planRestricted = isPlanAgent(beforeDelivery?.lastPromptAgent) || isPlanAgent(deliveryAgent)
+        const ownsSchedule = !scheduled || scheduledContinuations.get(sessionID) === scheduled
+        const reserved = continuationStillReserved(goal, beforeDelivery)
+        if (!beforeDelivery || !reserved || !ownsSchedule || busy || nativeRetrySessions.has(sessionID) ||
+          planRestricted || taskBlocked || beforeDelivery.shellDeferrals.some((item) => !item.delivered)) {
+          await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
+          if (isCurrent() && reserved && ownsSchedule && !nativeRetrySessions.has(sessionID)) {
+            if (planRestricted) await pauseGoalForPlanMode(sessionID)
+            else if (busy) await rearmBusyContinuation(sessionID, scheduled)
+            else if (taskBlocked) {
+              taskDeferredSessions.add(sessionID)
+              scheduleSettledContinuation(sessionID, taskRetryAt != null ? taskRetryAt - Date.now() : TASK_BLOCK_RETRY_MS, scheduled != null || taskRetryAt != null)
+            }
+          }
+          return
+        }
+        await sendContinuation(
+          client,
+          sessionID,
+          beforeDelivery.status === "active" ? continuationPrompt(beforeDelivery, locale) : limitPrompt(beforeDelivery, locale),
+          beforeDelivery.lastPromptAgent ?? deliveryAgent ?? null,
+        )
+        break
       }
-      if (scheduled && scheduledContinuations.get(sessionID) !== scheduled) {
-        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
-        return
-      }
-      await sendContinuation(
-        client,
-        sessionID,
-        goal.status === "active" ? continuationPrompt(goal, locale) : limitPrompt(goal, locale),
-        goal.lastPromptAgent ?? latestTurnAgent ?? null,
-      )
       if (!isCurrent()) {
         // The goal was stopped/replaced or the plugin disposed in flight: roll the
         // reserved turn back instead of committing a continuation afterward.
@@ -2041,6 +2128,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
   return {
     async dispose() {
       disposed = true
+      continuationEpochs.dispose()
       stopStateRecoveryReporting()
       for (const scheduled of scheduledContinuations.values()) clearTimeout(scheduled.timer)
       scheduledContinuations.clear()
@@ -2323,13 +2411,16 @@ const server: Plugin = async ({ client }, options?: Options) => {
         const status = (event as { properties?: Record<string, unknown> }).properties?.status
         if (isRecord(status) && typeof status.type === "string") {
           if (status.type === "busy") {
+            const epoch = continuationEpochs.current(sessionID)
+            const revision = (busyRevisions.get(sessionID) ?? 0) + 1
             busySessions.add(sessionID)
-            busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1)
+            busyRevisions.set(sessionID, revision)
             nativeRetrySessions.delete(sessionID)
-          }
-          if (status.type === "busy") {
             await markPendingContinuationStarted(sessionID)
-            armTurnWatchdog(sessionID)
+            if (!disposed && epoch === continuationEpochs.current(sessionID) &&
+              busyRevisions.get(sessionID) === revision && busySessions.has(sessionID) && !nativeRetrySessions.has(sessionID)) {
+              armTurnWatchdog(sessionID)
+            }
           }
           if (status.type === "idle") {
             explicitResumeRequests.delete(sessionID)
@@ -2509,6 +2600,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       }
       await deferGoalUntilShell(sessionID, shellID)
     },
+    decidePause: (sessionID, mutate) => continuationEpochs.decidePause(sessionID, mutate, () => goalServices.stopAutonomy(sessionID)),
     consumeExplicitResume: (sessionID) => explicitResumeRequests.delete(sessionID),
     consumeObjectiveEdit: (sessionID, objective) => {
       const edit = objectiveEdits.get(sessionID)
@@ -2608,28 +2700,28 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     try {
       if (disposed || !autonomyAvailable) return
       await taskRecoveryComplete
-      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID) || watchdogRescuedSessions.has(sessionID))
-        return
-      const goal = await getGoal(sessionID)
-      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
-      if (goal?.status !== "active" || isPlanAgent(goal.lastPromptAgent)) return
-      const latestStep = latestStepBySession.get(sessionID)
-      if (isPlanAgent(latestStep?.agent)) return
-      const taskStatus = taskBlockStatus(sessionID)
-      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
-      if (taskStatus && taskStatus.blocked) return
-      await reconcileShellDeferralsForHost(sessionID)
-      const current = await getGoalInternal(sessionID)
-      if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID)) return
-      if (current?.status !== "active" || current.shellDeferrals.some((item) => !item.delivered) || isPlanAgent(current.lastPromptAgent) || activeContinuationsV2.has(sessionID)) return
+      for (;;) {
+        if (!await continuationEpochs.waitUntilSettled(sessionID, epoch) || !isCurrent()) return
+        await reconcileShellDeferralsForHost(sessionID)
+        const current = await getGoalInternal(sessionID)
+        if (!isCurrent()) return
+        if (continuationEpochs.hasPending(sessionID)) continue
+        if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID) ||
+          nativeRetrySessions.has(sessionID) || stoppedExecutions.has(sessionID) ||
+          watchdogRescuedSessions.has(sessionID) || activeContinuationsV2.has(sessionID)) return
+        const latestStep = latestStepBySession.get(sessionID)
+        const taskStatus = taskBlockStatus(sessionID)
+        if (current?.status !== "active" || current.shellDeferrals.some((item) => !item.delivered) ||
+          isPlanAgent(current.lastPromptAgent) || isPlanAgent(latestStep?.agent) || (taskStatus && taskStatus.blocked)) return
 
-      turnWatchdogs.delete(sessionID)
-      activeContinuationsV2.add(sessionID)
-      claimedContinuation = true
-      claimedGoalID = current.id
-      watchdogRescuedSessions.add(sessionID)
-      if (!isCurrent()) return
-      await sendContinuation(sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? latestStep?.agent ?? null)
+        turnWatchdogs.delete(sessionID)
+        activeContinuationsV2.add(sessionID)
+        claimedContinuation = true
+        claimedGoalID = current.id
+        watchdogRescuedSessions.add(sessionID)
+        await sendContinuation(sessionID, continuationPrompt(current, locale), current.lastPromptAgent ?? latestStep?.agent ?? null)
+        break
+      }
       // Watchdog rescues are untracked retries: a delivered prompt arms the
       // pending-continuation window but never consumes an auto-turn or
       // no-progress budget (armNoProgress: false). The rescue delivers while
@@ -2888,24 +2980,57 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       attemptReservedAt = goal.pendingAttempt?.reservedAt ?? Date.now()
       attemptGoalID = goal.id
       attemptID = goal.pendingAttempt?.id
-      const beforeDelivery = await getGoalInternal(sessionID)
-      if (!isCurrent() || !continuationStillReserved(goal, beforeDelivery) || busySessions.has(sessionID) || nativeRetrySessions.has(sessionID)) {
-        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
-        if (isCurrent() && busySessions.has(sessionID)) await rearmBusyContinuation(sessionID, scheduled)
-        return
+      for (;;) {
+        const waitedForPause = continuationEpochs.hasPending(sessionID)
+        if (!await continuationEpochs.waitUntilSettled(sessionID, epoch) || !isCurrent()) {
+          await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
+          return
+        }
+        await reconcileShellDeferralsForHost(sessionID)
+        if (waitedForPause && scheduled && typeof context.session.wait === "function") {
+          const busyRevision = busyRevisions.get(sessionID) ?? 0
+          try {
+            const signal = AbortSignal.any([abortController.signal, AbortSignal.timeout(TASK_BLOCK_RETRY_MS)])
+            await context.session.wait({ sessionID }, { signal })
+          } catch {
+            await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
+            if (isCurrent() && !abortController.signal.aborted) await rearmBusyContinuation(sessionID, scheduled)
+            return
+          }
+          if ((busyRevisions.get(sessionID) ?? 0) === busyRevision) busySessions.delete(sessionID)
+        }
+        const beforeDelivery = await getGoalInternal(sessionID)
+        if (!isCurrent()) {
+          await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
+          return
+        }
+        if (continuationEpochs.hasPending(sessionID)) continue
+        const deliveryAgent = latestStepBySession.get(sessionID)?.agent
+        const taskStatus = taskBlockStatus(sessionID)
+        const planRestricted = isPlanAgent(beforeDelivery?.lastPromptAgent) || isPlanAgent(deliveryAgent)
+        const ownsSchedule = !scheduled || scheduledContinuations.get(sessionID) === scheduled
+        const reserved = continuationStillReserved(goal, beforeDelivery)
+        if (!beforeDelivery || !reserved || !ownsSchedule || stoppedExecutions.has(sessionID) ||
+          busySessions.has(sessionID) || nativeRetrySessions.has(sessionID) || planRestricted ||
+          (taskStatus && taskStatus.blocked) || beforeDelivery.shellDeferrals.some((item) => !item.delivered)) {
+          await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
+          if (isCurrent() && reserved && ownsSchedule && !stoppedExecutions.has(sessionID) && !nativeRetrySessions.has(sessionID)) {
+            if (planRestricted) await pauseGoalForPlanMode(sessionID)
+            else if (busySessions.has(sessionID)) await rearmBusyContinuation(sessionID, scheduled)
+            else if (taskStatus && taskStatus.blocked) {
+              taskDeferredSessions.add(sessionID)
+              scheduleSettledContinuation(sessionID, taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS, scheduled != null)
+            }
+          }
+          return
+        }
+        await sendContinuation(
+          sessionID,
+          beforeDelivery.status === "active" ? continuationPrompt(beforeDelivery, locale) : limitPrompt(beforeDelivery, locale),
+          beforeDelivery.lastPromptAgent ?? deliveryAgent ?? null,
+        )
+        break
       }
-      if (scheduled && scheduledContinuations.get(sessionID) !== scheduled) {
-        // Ownership of the scheduled continuation was lost (replaced or
-        // canceled) while we reserved: roll the reserved turn back so it does
-        // not consume an auto-turn.
-        await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
-        return
-      }
-      await sendContinuation(
-        sessionID,
-        goal.status === "active" ? continuationPrompt(goal, locale) : limitPrompt(goal, locale),
-        goal.lastPromptAgent ?? latestTurnAgent ?? null,
-      )
       if (!isCurrent()) {
         await rollbackContinuationAttempt(sessionID, { goalID: attemptGoalID, attemptID })
         return
@@ -3115,12 +3240,18 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           : event.type === "session.retry.scheduled" ? { type: "retry" } : data.status
         if (sessionID && isRecord(status) && typeof status.type === "string") {
           if (status.type === "busy") {
+            const epoch = continuationEpochs.current(sessionID)
+            const revision = (busyRevisions.get(sessionID) ?? 0) + 1
             stoppedExecutions.delete(sessionID)
             busySessions.add(sessionID)
-            busyRevisions.set(sessionID, (busyRevisions.get(sessionID) ?? 0) + 1)
+            busyRevisions.set(sessionID, revision)
             nativeRetrySessions.delete(sessionID)
             await markPendingContinuationStarted(sessionID)
-            armTurnWatchdog(sessionID)
+            if (!disposed && autonomyAvailable && epoch === continuationEpochs.current(sessionID) &&
+              busyRevisions.get(sessionID) === revision && busySessions.has(sessionID) &&
+              !nativeRetrySessions.has(sessionID) && !stoppedExecutions.has(sessionID)) {
+              armTurnWatchdog(sessionID)
+            }
           }
           if (status.type === "idle") {
             explicitResumeRequests.delete(sessionID)
@@ -3707,6 +3838,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (!disposed && !abortController.signal.aborted) {
         eventConsumerStopped = true
         autonomyAvailable = false
+        continuationEpochs.dispose()
         for (const scheduled of scheduledContinuations.values()) clearTimeout(scheduled.timer)
         scheduledContinuations.clear()
         for (const watchdog of turnWatchdogs.values()) clearTimeout(watchdog.timer)
@@ -3717,6 +3849,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
   return async () => {
     disposed = true
+    continuationEpochs.dispose()
     abortController.abort()
     for (const scheduled of scheduledContinuations.values()) clearTimeout(scheduled.timer)
     scheduledContinuations.clear()
