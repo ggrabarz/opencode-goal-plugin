@@ -269,6 +269,8 @@ If `XDG_DATA_HOME` is not set, the default is:
 
 Set `OPENCODE_GOAL_STATE_PATH` to use a custom file.
 
+Writers coordinate through an adjacent `goals.json.coord.sqlite` file; goal data remains in JSON. Ownership survives a paused process and is released automatically when that process exits. A writer that cannot acquire ownership within ten seconds reports a failure without changing the JSON. Keep the coordination file in place while plugin instances are running, and restart older instances after upgrading so every writer uses the same protocol.
+
 The state file is written atomically through a same-directory temp file: the final path is only ever replaced by a fully-flushed file, so after a crash the state is the previous or the new valid version, never a torn one. The file is created with owner-only permissions where the host filesystem supports them, and the temp name is a random UUID opened exclusively so concurrent writers cannot collide.
 
 Ordinary fsync improves crash consistency but is not `F_FULLFSYNC`, so sudden power loss on macOS/APFS is not an absolute durability guarantee; where the platform cannot fsync the parent directory, a crash may leave the old or the new state file (both valid), never a partially-written one. Existing active goals recover from disk with their full objective, budget, history, and checkpoint metadata. Cleared and replaced goals remain in bounded per-session history so a thread can host multiple goals over time without losing the prior lifecycle record.
