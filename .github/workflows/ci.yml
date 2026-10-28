@@ -13,6 +13,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-rename-lock:
+    name: Windows Rename Lock
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun test test/windows-rename.test.ts test/diagnostics.test.ts test/state-concurrency.test.ts test/state-lock.test.ts test/package.test.ts
+        env:
+          OPENCODE_REQUIRE_WINDOWS_TEST: "1"
+
+  node-runtime:
+    name: Node Runtime (${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22.13.0", "24"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun test test/package.test.ts test/state-concurrency.test.ts test/state-lock.test.ts
+        env:
+          OPENCODE_GOAL_STATE_PATH: ${{ runner.temp }}/goal-runtime/goals.json
+          XDG_DATA_HOME: ${{ runner.temp }}/goal-runtime/xdg
+
   typecheck:
     name: Typecheck
     runs-on: ubuntu-latest
@@ -36,6 +75,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install --frozen-lockfile
       - name: Run tests with coverage
