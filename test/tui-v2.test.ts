@@ -768,8 +768,7 @@ test("V2 palette command toasts a warning when no session is open", async () => 
   }
 })
 
-
-for (const failure of ["dialog.set", "dialog.select", "session.prompt", "toast.show"]) {
+for (const failure of ["dialog.set", "dialog.select", "session.prompt", "toast.show", "warning toast"]) {
   test(`V2 palette command contains ${failure} failures`, async () => {
     const { mock, slots, layers, setRoute, promptCalls, toasts } = makeMockContext()
     const error = new Error(`failed ${failure}`)
@@ -779,8 +778,14 @@ for (const failure of ["dialog.set", "dialog.select", "session.prompt", "toast.s
       return "refresh"
     }
     if (failure === "session.prompt") mock.client.session.prompt = async () => { throw error }
-    if (failure === "toast.show") mock.ui.toast.show = () => { throw new Error("toast failed") }
-    setRoute({ type: "session", sessionID: "ses_v2" })
+    const toastAttempts: Array<Parameters<typeof mock.ui.toast.show>[0]> = []
+    if (failure === "toast.show" || failure === "warning toast") {
+      mock.ui.toast.show = (options) => {
+        toastAttempts.push(options)
+        throw new Error("toast failed")
+      }
+    }
+    setRoute(failure === "warning toast" ? { type: "home" } : { type: "session", sessionID: "ses_v2" })
     const cleanup = setupTuiV2(mock as never)
     const app = slots.get("app")
     const setup = await testRender(() => app?.({ sessionID: "" }) as never, { width: 80, height: 20 })
@@ -789,7 +794,11 @@ for (const failure of ["dialog.set", "dialog.select", "session.prompt", "toast.s
       const command = layers[0]?.()?.commands?.find((candidate) => candidate.id === "goal.show")
       expect(command).toBeDefined()
       await command?.run()
-      if (failure !== "toast.show") {
+      if (failure === "toast.show" || failure === "warning toast") {
+        expect(toastAttempts.map((attempt) => attempt.variant)).toEqual(
+          failure === "warning toast" ? ["warning", "error"] : ["error"],
+        )
+      } else {
         expect(toasts).toHaveLength(1)
         expect(toasts[0]?.message).toBe(error.message)
         expect(toasts[0]?.variant).toBe("error")
