@@ -14234,7 +14234,8 @@ var EN_MESSAGES = {
     completionEvidence: "Completion evidence",
     blocker: "Blocker",
     achieved: "Goal achieved",
-    unmet: "Goal unmet"
+    unmet: "Goal unmet",
+    tldrLabel: "TL;DR"
   }
 };
 var ZH_CN_MESSAGES = {
@@ -14324,7 +14325,8 @@ var ZH_CN_MESSAGES = {
     completionEvidence: "\u5B8C\u6210\u8BC1\u636E",
     blocker: "\u963B\u585E\u539F\u56E0",
     achieved: "\u76EE\u6807\u5DF2\u8FBE\u6210",
-    unmet: "\u76EE\u6807\u672A\u8FBE\u6210"
+    unmet: "\u76EE\u6807\u672A\u8FBE\u6210",
+    tldrLabel: "TL;DR"
   }
 };
 function normalizeLocaleCandidate(value) {
