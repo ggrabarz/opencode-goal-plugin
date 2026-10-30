@@ -8,6 +8,7 @@ import plugin, {
   formatGoal,
   goalStateFromSession,
   goalStatusGlyph,
+  goalTldr,
   liveTimeUsedSeconds,
   readPersistedGoal,
 } from "../src/tui.ts"
@@ -550,4 +551,159 @@ test("clears the cached goal after clear_goal completes", () => {
   partsByMessage.set("cleared", [{ type: "tool", tool: "clear_goal", state: { status: "completed", output: "" } }])
 
   expect(goalStateFromSession(api as never, "clear-cache-session").goal).toBeNull()
+})
+
+test("goalTldr returns the first sentence of the objective", () => {
+  expect(goalTldr(goal({ objective: "Build the parser." }))).toBe("Build the parser.")
+  expect(goalTldr(goal({ objective: "Ship the feature! Done." }))).toBe("Ship the feature!")
+  expect(goalTldr(goal({ objective: "Fix the bug?" }))).toBe("Fix the bug?")
+  // Semicolon is a terminator, so the first sentence ends at the semicolon.
+  expect(goalTldr(goal({ objective: "Retry; it should work now." }))).toBe("Retry;")
+  expect(goalTldr(goal({ objective: "中文翻译。继续。" }))).toBe("中文翻译。")
+})
+
+test("goalTldr caps the result at 160 characters and appends an ellipsis when truncated", () => {
+  const long = "a".repeat(200)
+  expect(goalTldr(goal({ objective: long }))).toBe(`${"a".repeat(159)}…`)
+  const withTerminator = `${"a".repeat(100)}. ${"b".repeat(100)}.`
+  expect(goalTldr(goal({ objective: withTerminator }))).toBe(`${"a".repeat(100)}.`)
+  // Exactly 160 characters: no truncation.
+  const exactly160 = "x".repeat(159) + "."
+  expect(goalTldr(goal({ objective: exactly160 })).length).toBe(160)
+  expect(goalTldr(goal({ objective: exactly160 }))).toBe(exactly160)
+  // 161 characters total: truncated to 159 + ellipsis = 160.
+  const tooLong = "x".repeat(160) + "."
+  const tooLongTldr = goalTldr(goal({ objective: tooLong }))
+  expect(tooLongTldr.length).toBe(160)
+  expect(tooLongTldr.endsWith("…")).toBe(true)
+})
+
+test("goalTldr collapses multiline objectives into a single sentence", () => {
+  const multiline = "First sentence.\n\nSecond sentence.\n\tThird."
+  expect(goalTldr(goal({ objective: multiline }))).toBe("First sentence.")
+  expect(goalTldr(goal({ objective: "Line one   with   spaces.\nLine two." }))).toBe("Line one with spaces.")
+})
+
+test("goalTldr returns an empty string for an empty objective", () => {
+  expect(goalTldr(goal({ objective: "" }))).toBe("")
+  expect(goalTldr(goal({ objective: "   " }))).toBe("")
+})
+
+test("goalTldr returns the trimmed objective when there is no terminator", () => {
+  expect(goalTldr(goal({ objective: "no terminator here" }))).toBe("no terminator here")
+  expect(goalTldr(goal({ objective: "   spaced   out   " }))).toBe("spaced out")
+})
+
+test("the V1 goal state popup contains the TL;DR line", async () => {
+  const snapshot = goal({ objective: "popup tldr goal.\nSecond sentence." })
+  const registered: { value: string; keybind?: string; onSelect?: () => void }[] = []
+  let replaced: (() => unknown) | undefined
+  const api = {
+    slots: { register() { return "slot-id" } },
+    command: {
+      register(cb: () => { value: string; keybind?: string; onSelect?: () => void }[]) {
+        registered.push(...cb())
+        return () => {}
+      },
+    },
+    route: { current: { name: "session", params: { sessionID: "session" } } },
+    ui: {
+      toast() {},
+      dialog: {
+        setSize() {},
+        replace(render: () => unknown) {
+          replaced = render
+        },
+        clear() {},
+      },
+    },
+    theme: {
+      current: {
+        text: "#ffffff",
+        textMuted: "#888888",
+        primary: "#00ff00",
+        warning: "#ffcc00",
+        success: "#00ff00",
+        error: "#ff0000",
+      },
+    },
+    state: {
+      session: { messages: () => [{ id: "created" }] },
+      part: () => [
+        { type: "tool", tool: "create_goal", state: { status: "completed", output: JSON.stringify({ goal: snapshot }) } },
+      ],
+    },
+  }
+  await plugin.tui(api as never, undefined, undefined as never)
+
+  const command = registered.find((candidate) => candidate.value === "goal.state")
+  expect(command).toBeDefined()
+  await command?.onSelect?.()
+  // The popup reads the persisted state before it opens.
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  expect(replaced).toBeTypeOf("function")
+  const setup = await testRender(() => replaced?.() as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("TL;DR: popup tldr goal.")
+    expect(frame).toContain("popup tldr goal.")
+    expect(frame).toContain("Second sentence.")
+    setup.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) setup.renderer.destroy()
+  }
+})
+
+test("the V1 goal state popup shows no TL;DR row when there is no goal", async () => {
+  const registered: { value: string; keybind?: string; onSelect?: () => void }[] = []
+  let replaced: (() => unknown) | undefined
+  const api = {
+    slots: { register() { return "slot-id" } },
+    command: {
+      register(cb: () => { value: string; keybind?: string; onSelect?: () => void }[]) {
+        registered.push(...cb())
+        return () => {}
+      },
+    },
+    route: { current: { name: "session", params: { sessionID: "empty-session" } } },
+    ui: {
+      toast() {},
+      dialog: {
+        setSize() {},
+        replace(render: () => unknown) {
+          replaced = render
+        },
+        clear() {},
+      },
+    },
+    theme: { current: { text: "#ffffff", textMuted: "#888888" } },
+    state: {
+      session: { messages: () => [] },
+      part: () => [],
+    },
+  }
+  await plugin.tui(api as never, undefined, undefined as never)
+
+  const command = registered.find((candidate) => candidate.value === "goal.state")
+  expect(command).toBeDefined()
+  await command?.onSelect?.()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  expect(replaced).toBeTypeOf("function")
+  const setup = await testRender(() => replaced?.() as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("No recent goal state found in this session.")
+    expect(frame).not.toContain("TL;DR")
+    setup.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) setup.renderer.destroy()
+  }
 })

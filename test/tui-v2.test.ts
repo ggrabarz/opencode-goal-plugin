@@ -12,13 +12,16 @@ import type { SessionMessageAssistantTool, SessionMessageInfo } from "@opencode/
 import plugin, {
   goalFromV2Messages,
   goalStateLines,
+  goalStateShortcut,
   goalStatusGlyph,
   GOAL_STATUS_GLYPHS,
+  goalTldr,
   liveTimeUsedSeconds,
   readPersistedGoal,
   registerSlotV2,
   setupTuiV2,
   themeColorV2,
+  watchGoalStateBinding,
 } from "../src/tui.ts"
 import { atomicWriteFile } from "../src/atomic-write"
 import { messagesFor, resolveLocale } from "../src/i18n"
@@ -509,6 +512,73 @@ test("V2 setup registers sidebar.content, prompt.footer.status and app slots and
 
   cleanup()
   expect(disposed.sort()).toEqual(["app", "prompt.footer.status", "sidebar.content"])
+})
+
+test("goalStateShortcut reads the shortcut the host resolved and tolerates a dead keymap", () => {
+  expect(goalStateShortcut({ keymap: { shortcuts: () => ["f4"] } })).toEqual(["f4"])
+  expect(goalStateShortcut({ keymap: { shortcuts: () => [] } })).toBeNull()
+  expect(
+    goalStateShortcut({
+      keymap: {
+        shortcuts: () => {
+          throw new Error("keymap unavailable")
+        },
+      },
+    }),
+  ).toBeNull()
+})
+
+test("watchGoalStateBinding waits for the host to resolve the binding", async () => {
+  const resolved: string[] = []
+  const unresolved: string[] = []
+  let reads = 0
+  const stop = watchGoalStateBinding(
+    { keymap: { shortcuts: () => (++reads >= 3 ? ["f4"] : []) } },
+    { resolved: (message) => resolved.push(message), unresolved: (message) => unresolved.push(message) },
+    { timeoutMs: 1000, pollMs: 5 },
+  )
+
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  stop()
+
+  expect(resolved).toHaveLength(1)
+  expect(resolved[0]).toContain("shortcut=f4")
+  expect(unresolved).toHaveLength(0)
+})
+
+test("watchGoalStateBinding reports a binding the host never resolved", async () => {
+  const resolved: string[] = []
+  const unresolved: string[] = []
+  const stop = watchGoalStateBinding(
+    { keymap: { shortcuts: () => [] } },
+    { resolved: (message) => resolved.push(message), unresolved: (message) => unresolved.push(message) },
+    { timeoutMs: 30, pollMs: 5 },
+  )
+
+  await new Promise((resolve) => setTimeout(resolve, 120))
+  stop()
+
+  expect(resolved).toHaveLength(0)
+  expect(unresolved).toHaveLength(1)
+  expect(unresolved[0]).toContain("goal.state")
+  expect(unresolved[0]).toContain("no shortcut")
+})
+
+test("watchGoalStateBinding stops polling once it has reported", async () => {
+  let reads = 0
+  const stop = watchGoalStateBinding(
+    { keymap: { shortcuts: () => (++reads === 1 ? ["f4"] : []) } },
+    { resolved: () => {}, unresolved: () => {} },
+    { timeoutMs: 1000, pollMs: 5 },
+  )
+
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  stop()
+  const readsAfterStop = reads
+  await new Promise((resolve) => setTimeout(resolve, 40))
+
+  expect(readsAfterStop).toBe(1)
+  expect(reads).toBe(readsAfterStop)
 })
 
 test("goalFromV2Messages parses the newest completed goal tool output from text ToolContent", () => {
@@ -1025,6 +1095,9 @@ test("V2 the goal state popup is bound to a key and shows what the sidebar shows
         // lines below them are the lines of the sidebar.
         if (trimmed === "esc to close") continue
         if (trimmed.startsWith(goalStatusGlyph("paused"))) continue
+        if (trimmed.startsWith("TL;DR:")) continue
+        // Skip border frame lines (box drawing characters)
+        if (/^[┌│└┐┘├┤┬┴┼]/.test(trimmed)) continue
         expect(frame).toContain(trimmed)
       }
       // The status is coloured, the labels are quiet and the values are plain.
@@ -1137,6 +1210,89 @@ test("V2 palette command toasts the failure when the dialog cannot be shown", as
 
     await waitFor(() => toasts.length === 1)
     expect(toasts[0]?.message).toContain("the dialog could not be opened")
+
+    setup.renderer.destroy()
+    destroyed = true
+  } finally {
+    if (!destroyed) setup.renderer.destroy()
+    cleanup()
+  }
+})
+
+test("goalTldr returns the first sentence of the objective", () => {
+  expect(goalTldr(goal({ objective: "Build the parser." }))).toBe("Build the parser.")
+  expect(goalTldr(goal({ objective: "Ship the feature! Done." }))).toBe("Ship the feature!")
+  expect(goalTldr(goal({ objective: "Fix the bug?" }))).toBe("Fix the bug?")
+  // Semicolon is a terminator, so the first sentence ends at the semicolon.
+  expect(goalTldr(goal({ objective: "Retry; it should work now." }))).toBe("Retry;")
+  expect(goalTldr(goal({ objective: "中文翻译。继续。" }))).toBe("中文翻译。")
+})
+
+test("goalTldr caps the result at 160 characters and appends an ellipsis when truncated", () => {
+  const long = "a".repeat(200)
+  expect(goalTldr(goal({ objective: long }))).toBe(`${"a".repeat(159)}…`)
+  const withTerminator = `${"a".repeat(100)}. ${"b".repeat(100)}.`
+  expect(goalTldr(goal({ objective: withTerminator }))).toBe(`${"a".repeat(100)}.`)
+  // Exactly 160 characters: no truncation.
+  const exactly160 = "x".repeat(159) + "."
+  expect(goalTldr(goal({ objective: exactly160 })).length).toBe(160)
+  expect(goalTldr(goal({ objective: exactly160 }))).toBe(exactly160)
+  // 161 characters total: truncated to 159 + ellipsis = 160.
+  const tooLong = "x".repeat(160) + "."
+  const tooLongTldr = goalTldr(goal({ objective: tooLong }))
+  expect(tooLongTldr.length).toBe(160)
+  expect(tooLongTldr.endsWith("…")).toBe(true)
+})
+
+test("goalTldr collapses multiline objectives into a single sentence", () => {
+  const multiline = "First sentence.\n\nSecond sentence.\n\tThird."
+  expect(goalTldr(goal({ objective: multiline }))).toBe("First sentence.")
+  expect(goalTldr(goal({ objective: "Line one   with   spaces.\nLine two." }))).toBe("Line one with spaces.")
+})
+
+test("goalTldr returns an empty string for an empty objective", () => {
+  expect(goalTldr(goal({ objective: "" }))).toBe("")
+  expect(goalTldr(goal({ objective: "   " }))).toBe("")
+})
+
+test("goalTldr returns the trimmed objective when there is no terminator", () => {
+  expect(goalTldr(goal({ objective: "no terminator here" }))).toBe("no terminator here")
+  expect(goalTldr(goal({ objective: "   spaced   out   " }))).toBe("spaced out")
+})
+
+test("the V2 goal state popup contains the TL;DR line", async () => {
+  const { mock, slots, layers, setMessages, setRoute, shown } = makeMockContext()
+  const cleanup = setupTuiV2(mock as never)
+  const app = slots.get("app")
+  setMessages([
+    assistantMessage("created", [
+      goalTool("create_goal", JSON.stringify({ goal: goal({ objective: "popup tldr goal.\nSecond sentence.", status: "paused" }) })),
+    ]),
+  ])
+  setRoute({ type: "session", sessionID: "session" })
+
+  const setup = await testRender(() => app?.({ sessionID: "" }) as never, { width: 80, height: 20 })
+  let destroyed = false
+  try {
+    await setup.renderOnce()
+    const command = layers[0]?.()?.commands?.find((candidate) => candidate.id === "goal.state")
+    expect(command).toBeDefined()
+    command?.run()
+
+    await waitFor(() => shown.length === 1)
+    const popup = await testRender(() => shown[0]?.() as never, { width: 80, height: 20 })
+    let popupDestroyed = false
+    try {
+      await popup.renderOnce()
+      const popupFrame = popup.captureCharFrame()
+      expect(popupFrame).toContain("TL;DR: popup tldr goal.")
+      expect(popupFrame).toContain("popup tldr goal.")
+      expect(popupFrame).toContain("Second sentence.")
+      popup.renderer.destroy()
+      popupDestroyed = true
+    } finally {
+      if (!popupDestroyed) popup.renderer.destroy()
+    }
 
     setup.renderer.destroy()
     destroyed = true

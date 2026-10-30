@@ -139,3 +139,21 @@ export function reportPluginError(message: string, error?: unknown, stateFile?: 
     // Diagnostics must never break plugin control flow.
   }
 }
+
+/**
+ * Append one informational diagnostics line.
+ *
+ * For facts that are not failures but that no other channel can show: the V2
+ * TUI never reaches the OpenCode log, so a keybinding the host did or did not
+ * resolve can only be observed here.
+ */
+export function reportPluginNote(message: string, stateFile?: string) {
+  try {
+    const path = diagnosticsLogPath(stateFile)
+    mkdirSync(dirname(path), { recursive: true })
+    rotateIfNeeded(path)
+    appendFileSync(path, `${new Date().toISOString()} | info | ${message}\n`)
+  } catch {
+    // Diagnostics must never break plugin control flow.
+  }
+}

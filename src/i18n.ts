@@ -93,6 +93,7 @@ export type GoalMessages = {
     blocker: string
     achieved: string
     unmet: string
+    tldrLabel: string
   }
 }
 
@@ -221,6 +222,7 @@ const EN_MESSAGES: GoalMessages = {
     blocker: "Blocker",
     achieved: "Goal achieved",
     unmet: "Goal unmet",
+    tldrLabel: "TL;DR",
   },
 }
 
@@ -327,6 +329,7 @@ const ZH_CN_MESSAGES: GoalMessages = {
     blocker: "阻塞原因",
     achieved: "目标已达成",
     unmet: "目标未达成",
+    tldrLabel: "TL;DR",
   },
 }
 

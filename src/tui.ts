@@ -6,6 +6,7 @@ import { createEffect, createMemo, createRoot, createSignal, onCleanup } from "s
 import { readFile, stat } from "node:fs/promises"
 import type { GoalMessages } from "./i18n"
 import { messagesFor, presentGoalLastStatus, presentGoalStatus, presentGoalStopReason, resolveLocale } from "./i18n"
+import { reportPluginError, reportPluginNote } from "./diagnostics"
 import { statePath } from "./state-path"
 
 type GoalCheckpoint = {
@@ -203,6 +204,15 @@ function goalColorsV2(theme: unknown) {
     text: themeColorV2(theme, ["text", "base"], ["text", "default"], ["text"]),
     muted: themeColorV2(theme, ["text", "muted"], ["text", "subdued"], ["textMuted"]),
     achieved: themeColorV2(theme, ["text", "feedback", "success"], ["primary"], ["text", "base"], ["text", "default"], ["text"]),
+    tldr: themeColorV2(
+      theme,
+      ["text", "feedback", "info"],
+      ["accent"],
+      ["secondary"],
+      ["text", "base"],
+      ["text", "default"],
+      ["text"],
+    ),
   }
 }
 
@@ -640,6 +650,37 @@ export type GoalStateLine = {
 }
 
 /**
+ * Extracts a one-sentence TL;DR from the goal objective.
+ *
+ * The TL;DR is an at-a-glance summary for the popup header. It takes the
+ * first sentence of the objective, normalises whitespace, keeps the sentence
+ * terminator, and caps at 160 characters with a `…` ellipsis when truncated.
+ * This runs on the same GoalSnapshot the sidebar and popup read, so the TL;DR
+ * cannot drift from the full objective shown in the scrollbox.
+ */
+export function goalTldr(goal: GoalSnapshot): string {
+  const objective = goal.objective.trim()
+  if (!objective) return ""
+  // Collapse all whitespace (newlines, tabs, runs of spaces) into single spaces.
+  const collapsed = objective.replace(/\s+/g, " ")
+  // Find the first sentence terminator: . ! ? ; 。 ！ ？ ； or newline.
+  // We keep the terminator as part of the sentence.
+  const terminatorIndex = collapsed.search(/[.!?;。！？；\n]/)
+  let sentence: string
+  if (terminatorIndex >= 0) {
+    sentence = collapsed.slice(0, terminatorIndex + 1)
+  } else {
+    // No terminator at all: use the entire collapsed objective.
+    sentence = collapsed
+  }
+  // Cap at 160 characters total, including the ellipsis when truncated.
+  if (sentence.length > 160) {
+    return sentence.slice(0, 159) + "…"
+  }
+  return sentence
+}
+
+/**
  * The canonical view of the goal state.
  *
  * The sidebar renders these lines and the popup shows exactly these lines, so
@@ -692,6 +733,7 @@ type GoalDialogColors = {
   readonly text: unknown
   readonly muted: unknown
   readonly status: unknown
+  readonly tldr: unknown
 }
 
 /**
@@ -730,15 +772,38 @@ function goalStateDialogContent(
 ) {
   if (!goal) return box({}, [text({ fg: colors.muted }, [messages.tui.noGoal])])
   const lines = goalStateLines(goal, messages, locale).filter((line) => line.kind !== "title")
-  return box({ flexDirection: "column" }, [
+  const tldr = goalTldr(goal)
+  const content: ElementChild[] = [
     text({ fg: colors.status }, [`${goalStatusGlyph(goal.status)} ${messages.tui.title}`]),
+  ]
+  // Show the TL;DR row directly under the title when the objective yields one.
+  // The full objective stays in the scrollbox; this row is an at-a-glance summary.
+  if (tldr) {
+    content.push(
+      text({}, [
+        element("span", { style: { fg: colors.muted } }, [`${messages.tui.tldrLabel}: `]),
+        element("span", { style: { fg: colors.tldr } }, [tldr]),
+      ]),
+    )
+  }
+  content.push(
     element(
       "scrollbox",
       { scrollY: true, maxHeight, flexShrink: 1 },
-      [box({ flexDirection: "column" }, lines.map((line) => goalStateLineElement(line, colors, messages)))],
+      [box({ flexDirection: "column", padding: 1 }, lines.map((line) => goalStateLineElement(line, colors, messages)))],
     ),
-    text({ fg: colors.muted }, [messages.tui.closeHint]),
-  ])
+  )
+  content.push(text({ fg: colors.muted }, [messages.tui.closeHint]))
+  // Wrap in a box with a subtle border for a more polished, theme-aware look
+  // No padding on the outer box - the inner content has its own padding
+  return box(
+    {
+      flexDirection: "column",
+      borderStyle: "single",
+      borderColor: colors.muted,
+    },
+    content
+  )
 }
 
 /** The height of the scrolling area of the popup, in rows. */
@@ -841,6 +906,7 @@ async function showGoalStatePopupV1(
           text: theme.text,
           muted: theme.textMuted,
           status: goal ? goalStatusColorV1(goal.status, theme) : theme.textMuted,
+          tldr: theme.text,
         },
         goalDialogMaxHeight(api.renderer),
       ),
@@ -1041,7 +1107,7 @@ async function showSummaryV2(
         ]
       : []),
   ]
-  api.ui.dialog.set({ size: "large" })
+  api.ui.dialog.set({ size: "large", centered: true })
   let selected: string | undefined
   try {
     selected = await api.ui.dialog.select({
@@ -1142,6 +1208,7 @@ async function showGoalStatePopupV2(
           text: colors.text,
           muted: colors.muted,
           status: goal ? goalStatusColorV2(goal.status, api.theme) : colors.muted,
+          tldr: colors.tldr,
         },
         goalDialogMaxHeight(api.renderer),
       ),
@@ -1158,6 +1225,98 @@ async function showGoalStatePopupV2(
     // rejection in the host's TUI process.
     toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
   }
+}
+
+/** How long the host gets to turn the layer's `bind` into a real shortcut. */
+const GOAL_STATE_BINDING_TIMEOUT_MS = 3000
+const GOAL_STATE_BINDING_POLL_MS = 250
+
+/** The part of the TUI context the binding check needs. */
+export type GoalStateBindingHost = {
+  keymap: { shortcuts: (id: string) => readonly string[] }
+}
+
+/** Where the binding check reports its one result. */
+export type GoalStateBindingReport = {
+  resolved: (message: string) => void
+  unresolved: (message: string) => void
+}
+
+const defaultBindingReport: GoalStateBindingReport = {
+  resolved: (message) => reportPluginNote(message),
+  unresolved: (message) => reportPluginError(message),
+}
+
+/**
+ * Reads the shortcuts the host actually resolved for the popup command.
+ *
+ * The layer only records intent: the host parses `bind`, registers the command,
+ * and publishes the shortcut on a later tick. Reading the resolved shortcuts is
+ * the only way to tell a live binding from one the host dropped.
+ */
+export function goalStateShortcut(api: GoalStateBindingHost): readonly string[] | null {
+  try {
+    const shortcuts = api.keymap.shortcuts("goal.state")
+    return shortcuts.length > 0 ? shortcuts : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Polls the host keymap until `goal.state` resolves to a shortcut, then reports
+ * exactly one result.
+ *
+ * The binding is never available synchronously - an immediate read always sees
+ * an empty list even when the binding is fine - so a one-shot check would
+ * report a false failure. The result goes to the plugin's diagnostics log
+ * because the V2 TUI has no other channel: a layer that never became reachable
+ * is otherwise indistinguishable from a key the user never pressed.
+ *
+ * Returns a stop function for the owning component's cleanup.
+ */
+export function watchGoalStateBinding(
+  api: GoalStateBindingHost,
+  report: GoalStateBindingReport = defaultBindingReport,
+  timing: { timeoutMs?: number; pollMs?: number } = {},
+): () => void {
+  const timeoutMs = timing.timeoutMs ?? GOAL_STATE_BINDING_TIMEOUT_MS
+  const pollMs = timing.pollMs ?? GOAL_STATE_BINDING_POLL_MS
+  // Count attempts instead of reading the clock: a frozen Date.now (a test that
+  // pins system time) must not turn the deadline into an endless poll.
+  const maxAttempts = Math.max(1, Math.ceil(timeoutMs / pollMs))
+  let attempts = 0
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let stopped = false
+
+  const stop = () => {
+    stopped = true
+    if (timer !== undefined) clearTimeout(timer)
+    timer = undefined
+  }
+
+  const check = () => {
+    timer = undefined
+    if (stopped) return
+    const shortcuts = goalStateShortcut(api)
+    if (shortcuts) {
+      report.resolved(`tui keymap: goal.state is reachable, shortcut=${shortcuts.join(",")}`)
+      stop()
+      return
+    }
+    attempts += 1
+    if (attempts >= maxAttempts) {
+      report.unresolved(
+        `tui keymap: goal.state registered but the host resolved no shortcut after ${timeoutMs}ms; ${GOAL_STATE_KEYBIND} will not open the popup`,
+      )
+      stop()
+      return
+    }
+    timer = setTimeout(check, pollMs)
+  }
+
+  timer = setTimeout(check, pollMs)
+  return stop
 }
 
 function GoalKeymapLayerV2(api: TuiPluginV2.Context, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>) {
@@ -1193,6 +1352,9 @@ function GoalKeymapLayerV2(api: TuiPluginV2.Context, messages: GoalMessages, loc
       },
     ],
   }))
+  // Verify the binding against the running host instead of assuming that
+  // asking for f4 means the key works.
+  onCleanup(watchGoalStateBinding(api))
   return null
 }
 
