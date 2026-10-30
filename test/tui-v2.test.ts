@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test"
 import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
 import { writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -21,7 +21,7 @@ import { atomicWriteFile } from "../src/atomic-write"
 
 type GoalSnapshot = Parameters<typeof liveTimeUsedSeconds>[0]
 
-const previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
+let previousStatePath: string | undefined
 const isolatedStateDir = mkdtempSync(join(tmpdir(), "goal-tui-v2-"))
 const isolatedStatePath = join(isolatedStateDir, "goals.json")
 let hostTheme: ResolvedTheme | undefined
@@ -32,7 +32,6 @@ async function writeGoalState(value: unknown) {
 }
 
 beforeAll(async () => {
-  process.env.OPENCODE_GOAL_STATE_PATH = isolatedStatePath
   if (process.env.OPENCODE_TEST_HOST_THEME === "1") {
     const { resolvedHostTheme } = await import("./fixtures/host-theme")
     hostTheme = resolvedHostTheme()
@@ -40,6 +39,8 @@ beforeAll(async () => {
 })
 
 beforeEach(() => {
+  previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
+  process.env.OPENCODE_GOAL_STATE_PATH = isolatedStatePath
   try {
     unlinkSync(isolatedStatePath)
   } catch (error) {
@@ -47,9 +48,12 @@ beforeEach(() => {
   }
 })
 
-afterAll(() => {
+afterEach(() => {
   if (previousStatePath === undefined) delete process.env.OPENCODE_GOAL_STATE_PATH
   else process.env.OPENCODE_GOAL_STATE_PATH = previousStatePath
+})
+
+afterAll(() => {
   rmSync(isolatedStateDir, { recursive: true, force: true })
 })
 
@@ -767,3 +771,46 @@ test("V2 palette command toasts a warning when no session is open", async () => 
     cleanup()
   }
 })
+
+for (const failure of ["dialog.set", "dialog.select", "session.prompt", "toast.show", "warning toast"]) {
+  test(`V2 palette command contains ${failure} failures`, async () => {
+    const { mock, slots, layers, setRoute, promptCalls, toasts } = makeMockContext()
+    const error = new Error(`failed ${failure}`)
+    if (failure === "dialog.set") mock.ui.dialog.set = () => { throw error }
+    mock.ui.dialog.select = async () => {
+      if (failure === "dialog.select" || failure === "toast.show") throw error
+      return "refresh"
+    }
+    if (failure === "session.prompt") mock.client.session.prompt = async () => { throw error }
+    const toastAttempts: Array<Parameters<typeof mock.ui.toast.show>[0]> = []
+    if (failure === "toast.show" || failure === "warning toast") {
+      mock.ui.toast.show = (options) => {
+        toastAttempts.push(options)
+        throw new Error("toast failed")
+      }
+    }
+    setRoute(failure === "warning toast" ? { type: "home" } : { type: "session", sessionID: "ses_v2" })
+    const cleanup = setupTuiV2(mock as never)
+    const app = slots.get("app")
+    const setup = await testRender(() => app?.({ sessionID: "" }) as never, { width: 80, height: 20 })
+    try {
+      await setup.renderOnce()
+      const command = layers[0]?.()?.commands?.find((candidate) => candidate.id === "goal.show")
+      expect(command).toBeDefined()
+      await command?.run()
+      if (failure === "toast.show" || failure === "warning toast") {
+        expect(toastAttempts.map((attempt) => attempt.variant)).toEqual(
+          failure === "warning toast" ? ["warning", "error"] : ["error"],
+        )
+      } else {
+        expect(toasts).toHaveLength(1)
+        expect(toasts[0]?.message).toBe(error.message)
+        expect(toasts[0]?.variant).toBe("error")
+      }
+      expect(promptCalls).toHaveLength(0)
+    } finally {
+      setup.renderer.destroy()
+      cleanup()
+    }
+  })
+}

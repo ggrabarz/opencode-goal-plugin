@@ -69,6 +69,7 @@ async function waitForContinuation(calls: unknown[], deadlineMs = 2000) {
 }
 
 let dir = ""
+let previousStatePath: string | undefined
 const serverDisposers: Array<() => Promise<void>> = []
 
 async function setupServer(...args: Parameters<typeof plugin.server>) {
@@ -92,6 +93,7 @@ async function markExplicitResume(hooks: Awaited<ReturnType<typeof setupServer>>
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-"))
+  previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
   process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals.json")
 })
 
@@ -279,7 +281,8 @@ for (const signal of ["session.error", "message.updated"]) {
 
 afterEach(async () => {
   for (const dispose of serverDisposers.splice(0).reverse()) await dispose()
-  delete process.env.OPENCODE_GOAL_STATE_PATH
+  if (previousStatePath === undefined) delete process.env.OPENCODE_GOAL_STATE_PATH
+  else process.env.OPENCODE_GOAL_STATE_PATH = previousStatePath
   await rm(dir, { recursive: true, force: true })
 })
 
@@ -4731,3 +4734,102 @@ for (const pauseKind of ["Plan mode", "overlapping rejected blocker"]) {
     }
   }, 10_000)
 }
+
+test("V1 a failing event does not reject the hook", async () => {
+  const calls: unknown[] = []
+  const client = { session: { promptAsync: async (input: unknown) => { calls.push(input) } } }
+  const hooks = await setupServer({ client } as never, { auto_continue: true, max_auto_turns: 5 })
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await requireTool(hooks.tool?.create_goal, "create_goal").execute(
+    { objective: "survive a failing event" },
+    { sessionID: "ses_1" } as never,
+  )
+  const original = await readFile(stateFile, "utf8")
+
+  await writeFile(stateFile, "{ not json", "utf8")
+  await hooks.event!({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "m1",
+          sessionID: "ses_1",
+          role: "assistant",
+          time: { completed: Date.now() },
+          parts: [{ type: "text", text: "hello" }],
+        },
+      },
+    } as never,
+  })
+
+  await writeFile(stateFile, original, "utf8")
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } } as never)
+  await waitFor(() => calls.length >= 1, 3000)
+  expect(calls.length).toBeGreaterThanOrEqual(1)
+})
+
+test("V1 a failing tool hook does not fail the tool call", async () => {
+  const client = { session: { promptAsync: async () => {} } }
+  const hooks = await setupServer({ client } as never, { auto_continue: false })
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const before = hooks["tool.execute.before"]
+  const after = hooks["tool.execute.after"]
+  expect(before).toBeDefined()
+  expect(after).toBeDefined()
+  const output = { title: "bash", output: "done", metadata: {} }
+  await before!({ tool: "bash", sessionID: "ses_1", callID: "call_1", args: {} } as never, output as never)
+  await after!({ tool: "bash", sessionID: "ses_1", callID: "call_1", args: {} } as never, output as never)
+})
+
+test("V1 a failing message hook does not reject the hook", async () => {
+  const client = { session: { promptAsync: async () => {} } }
+  const hooks = await setupServer({ client } as never, { auto_continue: false })
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const chat = hooks["chat.message"]
+  expect(chat).toBeDefined()
+  await chat!({ sessionID: "ses_1", agent: "build" } as never, { message: { id: "m1", parts: [] } } as never)
+})
+
+test("V1 bookkeeping failures preserve tool output and explicit pause failures", async () => {
+  const hooks = await setupServer({ client: {} } as never, { auto_continue: false })
+  const config = {} as { command?: Record<string, { template: string }> }
+  await hooks.config!(config as never)
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "{ not json", "utf8")
+  const result = { title: "read", output: "existing output", metadata: { provider: "host" } }
+  await hooks["tool.execute.after"]!({ tool: "read", sessionID: "ses_1", callID: "read_1", args: {} }, result)
+  expect(result).toEqual({ title: "read", output: "existing output", metadata: { provider: "host" } })
+  await expect(hooks["command.execute.before"]!(
+    { command: "pause_goal", sessionID: "ses_1", arguments: "" },
+    { parts: [{ type: "text", text: config.command!.pause_goal!.template }] } as never,
+  )).rejects.toThrow()
+  await expect(requireTool(hooks.tool?.create_goal, "create_goal").execute(
+    { objective: "must persist" }, { sessionID: "ses_1" } as never,
+  )).rejects.toThrow()
+  expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe("{ not json")
+  expect(await readFile(join(dir, "goal-plugin.log"), "utf8")).toContain("Failed to run tool.execute.after")
+})
+
+test("V1 a failed tool-start read cannot clear a later continuation attempt", async () => {
+  const hooks = await setupServer({ client: {} } as never, { auto_continue: false })
+  await createGoal("ses_1", "preserve the later attempt", null)
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const original = await readFile(file, "utf8")
+  await writeFile(file, "{ not json", "utf8")
+  await hooks["tool.execute.before"]!({ tool: "read", sessionID: "ses_1", callID: "old" }, { args: {} })
+  await writeFile(file, original, "utf8")
+  const reserved = await reserveContinuation("ses_1", 5, 0)
+  await hooks["tool.execute.after"]!({ tool: "read", sessionID: "ses_1", callID: "old", args: {} }, { title: "read", output: "old output", metadata: {} })
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt?.id).toBe(reserved?.pendingAttempt?.id)
+})
+
+test("V1 a failed user-abort write still rejects the control event", async () => {
+  const hooks = await setupServer({ client: {} } as never, { auto_continue: false })
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "{ not json", "utf8")
+  await expect(hooks.event!({ event: { type: "session.error", properties: {
+    sessionID: "ses_1", error: { name: "MessageAbortedError", data: { message: "The operation was aborted." } },
+  } } } as never)).rejects.toThrow()
+})
