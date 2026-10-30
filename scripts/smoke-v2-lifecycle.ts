@@ -1,6 +1,7 @@
 // Runs the installed OpenCode V2 binary against a deterministic local model.
 // No real provider credentials, shared service, or user goal state are used.
 import assert from "node:assert/strict"
+import { spawn } from "node:child_process"
 import { cp, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -55,6 +56,7 @@ const model = Bun.serve({
   },
 })
 
+try {
 await mkdir(join(root, "config/opencode"), { recursive: true })
 const localPluginPath = join(root, "plugin")
 if (!registryPackage) {
@@ -104,28 +106,96 @@ if (registryPackage) {
     throw new Error(`Plugin installation failed; inspect ${root}/install.log`)
   }
 }
-const child = Bun.spawn([binary, "serve", "--hostname", "127.0.0.1", "--port", "0"], {
-  cwd: project, env, stdout: "pipe", stderr: "pipe",
+const child = spawn(binary, ["serve", "--hostname", "127.0.0.1", "--port", "0"], {
+  cwd: project, env, stdio: ["ignore", "pipe", "pipe"],
+  // POSIX detached starts a private process group, including inherited-pipe children.
+  detached: process.platform !== "win32",
 })
 let output = ""
-const consume = async (stream: ReadableStream<Uint8Array>) => {
-  for await (const chunk of stream) output += new TextDecoder().decode(chunk)
+let spawnError: Error | undefined
+const exited = new Promise<void>((resolve) => {
+  child.once("exit", () => resolve())
+  child.once("error", (error) => { spawnError = error; resolve() })
+})
+for (const stream of [child.stdout, child.stderr]) {
+  stream.setEncoding("utf8")
+  stream.on("data", (chunk: string) => { output += chunk })
+  stream.on("error", (error) => { spawnError ??= error })
 }
-const readers = Promise.all([consume(child.stdout), consume(child.stderr)])
+async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([work, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Smoke cleanup timed out")), ms)
+    })])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+async function stopServerTree() {
+  if (child.pid === undefined) return
+  if (process.platform === "win32") {
+    if (child.exitCode != null || child.signalCode != null) {
+      throw new Error("Cannot verify Windows descendants after the server exited")
+    }
+    const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" })
+    try {
+      await bounded(new Promise<void>((resolve, reject) => {
+        killer.once("error", reject)
+        killer.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`taskkill failed: ${code}`)))
+      }), 3000)
+    } finally {
+      killer.kill()
+      killer.unref()
+    }
+  } else {
+    const groupExists = () => {
+      try { process.kill(-child.pid!, 0); return true } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return false
+        throw error
+      }
+    }
+    try { process.kill(-child.pid, "SIGKILL") } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
+    }
+    const stopDeadline = Date.now() + 3000
+    while (groupExists()) {
+      if (Date.now() >= stopDeadline) throw new Error("Server process group survived cleanup")
+      await Bun.sleep(25)
+    }
+  }
+  await bounded(exited, 1000)
+}
+let cleanup: Promise<void> | undefined
+const stop = () => cleanup ??= stopServerTree()
+const interrupt = (code: number) => {
+  void stop().catch((error: unknown) => console.error("Smoke cleanup failed:", error)).finally(() => {
+    child.stdout.destroy()
+    child.stderr.destroy()
+    model.stop(true)
+    process.exit(code)
+  })
+}
+const onInterrupt = () => interrupt(130)
+const onTerminate = () => interrupt(143)
+process.once("SIGINT", onInterrupt)
+process.once("SIGTERM", onTerminate)
 const deadline = Date.now() + Number(process.env.OPENCODE_SMOKE_TIMEOUT_MS ?? 30000)
 let lastStage: string | undefined
 const waitFor = async (stage: string, check: () => boolean | Promise<boolean>, diagnose?: () => string) => {
   lastStage = stage
   while (Date.now() < deadline) {
     if (await check()) return
-    if (child.exitCode != null) throw new Error(`Private V2 exited: ${output.slice(-4000)}`)
+    if (spawnError) throw spawnError
+    if (child.exitCode != null || child.signalCode != null) throw new Error(`Private V2 exited: ${output.slice(-4000)}`)
     await Bun.sleep(50)
   }
   const details = diagnose?.()
   const observed = `modelCalls=${modelCalls}, continuationCalls=${continuationCalls}${details ? `; ${details}` : ""}`
   throw new Error(`Smoke timeout at stage "${stage}"; ${observed}; logs=${root}/server.log`)
 }
-let passed = false
+let summary: Record<string, unknown> | undefined
+let failure: unknown
 try {
   await waitFor("server-ready", () => /http:\/\/127\.0\.0\.1:\d+/.test(output))
   const base = output.match(/http:\/\/127\.0\.0\.1:\d+/)![0]
@@ -215,7 +285,7 @@ try {
     try { state = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8")) } catch { return false }
     return state?.goals[arraysSession.data.id] != null
   })
-  const summary = {
+  summary = {
     result: "PASS",
     packagePath,
     hostVersion,
@@ -226,18 +296,32 @@ try {
     autoTurns: state!.goals[sessionID]!.autoTurns,
     artifacts: root,
   }
-  console.log(JSON.stringify(summary, null, 2))
-  passed = true
+} catch (error) {
+  failure = error
+  console.error(error)
 } finally {
-  child.kill()
-  await child.exited
-  await readers
-  await writeFile(join(root, "server.log"), output)
-  model.stop(true)
+  try {
+    await writeFile(join(root, "server.log"), output)
+  } catch (error) {
+    failure ??= error
+  }
+  try {
+    await stop()
+  } catch (error) {
+    console.error("Smoke cleanup failed:", error)
+    failure ??= error
+  } finally {
+    child.stdout.destroy()
+    child.stderr.destroy()
+    child.unref()
+    process.removeListener("SIGINT", onInterrupt)
+    process.removeListener("SIGTERM", onTerminate)
+    model.stop(true)
+  }
   // On failure, preserve diagnostics before the temp root disappears: a bare
   // timeout cannot say which final condition was stuck, and CI uploads the
   // copied directory as an artifact via OPENCODE_SMOKE_ARTIFACTS_DIR.
-  if (!passed) {
+  if (failure !== undefined) {
     try {
       const summary = {
         failed: true,
@@ -258,4 +342,10 @@ try {
       console.error(`Failed to preserve smoke artifacts: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
+}
+
+if (failure !== undefined) throw failure
+console.log(JSON.stringify(summary, null, 2))
+} finally {
+  model.stop(true)
 }
