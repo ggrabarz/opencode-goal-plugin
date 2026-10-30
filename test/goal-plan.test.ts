@@ -16,17 +16,12 @@ import {
 } from "../src/state"
 
 let dir: string
-let previousStatePath: string | undefined
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "goal-plan-test-"))
-  previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
   process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals.json")
 })
 afterEach(async () => {
-  // The state path is restored rather than removed: the default path is the
-  // goal state of the running plugin, which a test run must never touch.
-  if (previousStatePath === undefined) delete process.env.OPENCODE_GOAL_STATE_PATH
-  else process.env.OPENCODE_GOAL_STATE_PATH = previousStatePath
+  delete process.env.OPENCODE_GOAL_STATE_PATH
   await rm(dir, { recursive: true, force: true })
 })
 

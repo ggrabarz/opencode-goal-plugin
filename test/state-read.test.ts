@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   MISSING_READ_ATTEMPTS,
+  MISSING_READ_RETRY_DELAY_MS,
   READ_ATTEMPTS,
   READ_RETRY_DELAY_MS,
   isTransientReadError,
@@ -22,30 +23,10 @@ function makeOps(readFile: StateReadOps["readFile"], platform: NodeJS.Platform =
 }
 
 test("a transient missing file is retried", async () => {
-  // The rename that replaces the state file is not atomic on Windows, so a
-  // concurrent reader can find the file momentarily missing.
   let attempts = 0
   const ops = makeOps(async (path) => {
     attempts += 1
     if (attempts === 1) throw errno("ENOENT", "no such file")
-    return await import("node:fs/promises").then((fs) => fs.readFile(path, "utf8"))
-  })
-  const dir = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-read-"))
-  try {
-    const file = join(dir, "goals.json")
-    await writeFile(file, "payload")
-    expect(await readStateFile(file, ops)).toBe("payload")
-    expect(attempts).toBe(2)
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-  }
-})
-
-test("a transient lock failure is retried", async () => {
-  let attempts = 0
-  const ops = makeOps(async (path) => {
-    attempts += 1
-    if (attempts === 1) throw errno("EPERM", "operation not permitted")
     return await import("node:fs/promises").then((fs) => fs.readFile(path, "utf8"))
   })
   const dir = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-read-"))
@@ -69,16 +50,6 @@ test("a genuine failure is not retried", async () => {
   expect(attempts).toBe(1)
 })
 
-test("a persistent transient failure gives up after the budget", async () => {
-  let attempts = 0
-  const ops = makeOps(async () => {
-    attempts += 1
-    throw errno("EPERM", "operation not permitted")
-  })
-  await expect(readStateFile("C:/nowhere/goals.json", ops)).rejects.toThrow()
-  expect(attempts).toBe(READ_ATTEMPTS)
-})
-
 test("transient read errors are classified per platform", () => {
   expect(isTransientReadError(errno("ENOENT", "gone"), "win32")).toBe(true)
   expect(isTransientReadError(errno("EPERM", "denied"), "win32")).toBe(true)
@@ -87,15 +58,54 @@ test("transient read errors are classified per platform", () => {
   expect(READ_RETRY_DELAY_MS).toBeGreaterThan(0)
 })
 
-test("a genuinely missing file is not retried for long", async () => {
-  // A file that is missing is a normal state for a fresh install, so the
-  // retries have to be short: a long wait delays the first write enough to
-  // reorder the events around it.
+test("a missing state file requests only two short delays", async () => {
   let attempts = 0
+  const delays: number[] = []
   const ops = makeOps(async () => {
     attempts += 1
     throw errno("ENOENT", "no such file")
   })
+  ops.sleep = async (ms) => { delays.push(ms) }
   await expect(readStateFile("C:/nowhere/goals.json", ops)).rejects.toThrow()
   expect(attempts).toBe(MISSING_READ_ATTEMPTS)
+  expect(delays).toEqual([MISSING_READ_RETRY_DELAY_MS, MISSING_READ_RETRY_DELAY_MS])
+})
+
+for (const code of ["EPERM", "EACCES", "EBUSY"]) {
+  test(`Windows state reads recover from ${code}`, async () => {
+    let attempts = 0
+    const ops = makeOps(async () => {
+      if (++attempts < 3) throw errno(code, "locked")
+      return "persisted JSON"
+    })
+    expect(await readStateFile("isolated.json", ops)).toBe("persisted JSON")
+    expect(attempts).toBe(3)
+  })
+
+  test(`Windows state reads exhaust ${code}`, async () => {
+    let attempts = 0
+    const ops = makeOps(async () => { attempts++; throw errno(code, "locked") })
+    await expect(readStateFile("isolated.json", ops)).rejects.toThrow("locked")
+    expect(attempts).toBe(READ_ATTEMPTS)
+  })
+
+  test(`POSIX state reads reject ${code} immediately`, async () => {
+    let attempts = 0
+    const ops = makeOps(async () => { attempts++; throw errno(code, "denied") }, "linux")
+    await expect(readStateFile("isolated.json", ops)).rejects.toThrow("denied")
+    expect(attempts).toBe(1)
+  })
+}
+
+test("mixed transient and missing errors retain a bounded total retry budget", async () => {
+  let attempts = 0
+  let waits = 0
+  const ops = makeOps(async () => {
+    attempts++
+    throw errno(attempts < 5 ? "EBUSY" : "ENOENT", "unavailable")
+  })
+  ops.sleep = async () => { waits++ }
+  await expect(readStateFile("isolated.json", ops)).rejects.toThrow("unavailable")
+  expect(attempts).toBe(7)
+  expect(waits).toBe(6)
 })

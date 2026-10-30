@@ -300,7 +300,8 @@ function showSummary(
                 ),
               ]
             : []),
-          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited"
+          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited" ||
+            (goal.status === "cancelled" && goal.stopReason === "interrupted")
             ? [
                 actionOption(
                   api,
@@ -694,7 +695,8 @@ async function showSummaryV2(
           ...(goal.status === "active"
             ? [{ title: messages.tui.pause, value: "pause", description: messages.tui.pauseDescription }]
             : []),
-          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited"
+          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited" ||
+            (goal.status === "cancelled" && goal.stopReason === "interrupted")
             ? [{ title: messages.tui.resume, value: "resume", description: messages.tui.resumeDescription }]
             : []),
           { title: messages.tui.clear, value: "clear", description: messages.tui.clearDescription },
@@ -702,19 +704,11 @@ async function showSummaryV2(
       : []),
   ]
   api.ui.dialog.set({ size: "large" })
-  let selected: string | undefined
-  try {
-    selected = await api.ui.dialog.select({
-      title: messages.tui.title,
-      placeholder: formatGoal(goal, messages, locale),
-      options,
-    })
-  } catch (error) {
-    // The command runs detached, so a rejection here would be an unhandled
-    // rejection in the host's TUI process.
-    toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
-    return
-  }
+  const selected = await api.ui.dialog.select({
+    title: messages.tui.title,
+    placeholder: formatGoal(goal, messages, locale),
+    options,
+  })
   const prompt = selected === "refresh" ? refreshGoalPrompt(messages)
     : selected === "history" ? historyGoalPrompt(messages)
     : selected === "pause" ? pauseGoalPrompt(messages)
