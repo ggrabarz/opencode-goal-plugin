@@ -5,6 +5,7 @@ Thanks for your interest in improving `@prevalentware/opencode-goal-plugin`. Thi
 ## Prerequisites
 
 - [Bun](https://bun.sh) (the project is built, tested, and bundled with Bun)
+- Node.js 24 with npm, for package validation and the packed-entrypoint resolver tests
 - An [OpenCode](https://opencode.ai) install if you want to try the plugin end to end
 
 ## Getting started

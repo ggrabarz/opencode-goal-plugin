@@ -84,34 +84,14 @@ export function isUnsupportedSyncDirError(error: unknown, platform: NodeJS.Platf
   )
 }
 
-/**
- * Errors that can transiently fail a same-directory rename, most commonly on
- * Windows when the target file is briefly locked by another process (antivirus
- * scanners, an OpenCode session holding the state file open). These are worth a
- * small bounded retry before giving up. Anything else (EIO, ENOENT, ENOSPC...)
- * is a genuine failure and must not be retried.
- */
-export function isTransientRenameError(error: unknown, platform: NodeJS.Platform): boolean {
+export function isTransientWindowsFileError(error: unknown, platform: NodeJS.Platform): boolean {
   if (platform !== "win32") return false
   const code = (error as NodeJS.ErrnoException | null)?.code
   return code === "EPERM" || code === "EACCES" || code === "EBUSY"
 }
 
-/**
- * Total attempts for a transient exclusive create of the temp file.
- *
- * Creating the temp file can fail the same way the rename does: on Windows a
- * directory that another process is modifying, or a scanner that is walking
- * it, can make an exclusive create fail with EPERM even though nothing is
- * holding the temp path. The write is the most important operation in the
- * plugin, because a failed write loses a goal update, so the create is
- * retried with the same bounded budget as the rename.
- */
 export const OPEN_ATTEMPTS = 10
 
-/**
- * Open the temp file, retrying a transient exclusive-create failure.
- */
 async function openWithRetry(
   ops: AtomicWriteOps,
   path: string,
@@ -124,7 +104,7 @@ async function openWithRetry(
       return await ops.open(path, flags, mode)
     } catch (error) {
       attempt += 1
-      if (!isTransientRenameError(error, ops.platform) || attempt >= OPEN_ATTEMPTS) throw error
+      if (!isTransientWindowsFileError(error, ops.platform) || attempt >= OPEN_ATTEMPTS) throw error
       await ops.sleep(renameRetryDelayMs(attempt))
     }
   }
@@ -208,17 +188,7 @@ export const defaultAtomicWriteOps: AtomicWriteOps = {
   sleep: defaultSleep,
 }
 
-/**
- * Total rename attempts for transient Windows replacement errors.
- *
- * The budget has to cover how long Windows actually holds the target. A
- * rename-over-existing fails with `EPERM`/`EACCES` while an antivirus
- * scanner, a search indexer, or another process keeps the file open, and
- * those locks routinely outlive a couple of hundred milliseconds. The old
- * three-attempt budget (60ms of waiting in total) gave up while the lock
- * was still held and surfaced `EPERM` to the caller, which turned a
- * transient Windows file lock into a failed goal state write.
- */
+/** Total rename attempts for transient Windows replacement errors. */
 export const RENAME_ATTEMPTS = 10
 
 /** Base backoff between rename retries (doubled per attempt). */
@@ -230,11 +200,9 @@ export const RENAME_RETRY_MAX_DELAY_MS = 500
 /**
  * Backoff before the next rename attempt.
  *
- * Exponential so a briefly-locked target is retried quickly, capped so a
- * target that stays locked cannot block the caller indefinitely. The full
- * budget (10 attempts) waits roughly 2.6 seconds in the worst case, which
- * covers the multi-second locks observed on Windows hosts while keeping
- * the common (uncontended) path at a single rename.
+ * Nine waits total 2620ms, extending the previous 60ms retry window.
+ * Filesystem operations take additional time; this bounds backoff, not I/O.
+ * An uncontended write still performs a single rename without waiting.
  */
 export function renameRetryDelayMs(attempt: number) {
   const exponential = RENAME_RETRY_DELAY_MS * 2 ** Math.max(0, attempt - 1)
@@ -251,7 +219,7 @@ async function renameWithRetry(ops: AtomicWriteOps, from: string, to: string): P
       attempt += 1
       // A non-transient error fails immediately; transient errors get a small,
       // bounded number of attempts (renaming over a briefly-locked target).
-      if (!isTransientRenameError(error, ops.platform) || attempt >= RENAME_ATTEMPTS) throw error
+      if (!isTransientWindowsFileError(error, ops.platform) || attempt >= RENAME_ATTEMPTS) throw error
       await ops.sleep(renameRetryDelayMs(attempt))
     }
   }

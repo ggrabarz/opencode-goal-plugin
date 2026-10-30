@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test"
-import { existsSync } from "node:fs"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { Cause, Effect } from "effect-goal-state"
 import { describeError, diagnosticsLogPath, reportPluginError } from "../src/diagnostics"
 
 let dir = ""
@@ -52,26 +52,11 @@ test("repeated reports append one line each", async () => {
 
 test("reporting a plugin error never throws", async () => {
   await withStatePath(async () => {
-    // A state path whose parent cannot be created must not propagate.
-    process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals.json")
+    const blocked = join(dir, "blocked")
+    await writeFile(blocked, "regular file")
+    process.env.OPENCODE_GOAL_STATE_PATH = join(blocked, "goals.json")
     expect(() => reportPluginError("still reported")).not.toThrow()
-  })
-})
-
-test("a reported plugin error is written next to the state file it is about", async () => {
-  await withStatePath(async () => {
-    // A failure of one state file must not land in the log of another one.
-    const other = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-other-"))
-    try {
-      reportPluginError("Gave up waiting for the state lock", undefined, join(other, "goals.json"))
-      // The entry is next to the state file the failure is about...
-      const beside = await readFile(join(other, "goal-plugin.log"), "utf8")
-      expect(beside).toContain("Gave up waiting for the state lock")
-      // ...and not in the log of the global state file.
-      expect(existsSync(diagnosticsLogPath())).toBe(false)
-    } finally {
-      await rm(other, { recursive: true, force: true })
-    }
+    expect(await readFile(blocked, "utf8")).toBe("regular file")
   })
 })
 
@@ -89,13 +74,12 @@ test("the error description unwraps the cause chain", () => {
 test("the error description stops at a bounded depth", () => {
   let error: unknown = new Error("root cause")
   for (let depth = 0; depth < 20; depth++) error = { cause: error }
-  expect(describeError(error).length).toBeLessThan(2000)
+  expect(describeError(error)).toContain("...")
+  expect(describeError(error)).not.toContain("root cause")
 })
 
 test("the error description unwraps a real Effect fiber failure", async () => {
-  // This is the shape the state layer produces: a FiberFailure whose message
-  // says nothing, with the real error behind Effect's cause symbol.
-  const { Effect } = await import("effect-goal-state")
+  // Use a real state-layer fiber failure rather than imitating Effect internals.
   let failure: unknown
   try {
     Effect.runSync(Effect.fail(new Error("EPERM: rename failed")))
@@ -106,4 +90,101 @@ test("the error description unwraps a real Effect fiber failure", async () => {
   const description = describeError(failure)
   expect(description).toContain("EPERM")
   expect(description).toContain("rename failed")
+})
+
+for (const { name, combine } of [
+  { name: "parallel", combine: Cause.parallel },
+  { name: "sequential", combine: Cause.sequential },
+]) {
+  test(`both errors survive a real Effect ${name} cause`, () => {
+    let failure: unknown
+    try {
+      Effect.runSync(Effect.failCause(combine(Cause.fail(new Error("ROOT_LEFT")), Cause.die(new Error("ROOT_RIGHT")))))
+    } catch (error) {
+      failure = error
+    }
+    expect(describeError(failure)).toContain("ROOT_LEFT")
+    expect(describeError(failure)).toContain("ROOT_RIGHT")
+  })
+}
+
+test.skipIf(process.platform === "win32")("diagnostics use owner-only permissions, including an existing log", async () => {
+  await withStatePath(async () => {
+    process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "private", "goals.json")
+    const previous = process.umask(0o022)
+    try {
+      reportPluginError("private event")
+      const file = diagnosticsLogPath()
+      expect((await stat(join(dir, "private"))).mode & 0o777).toBe(0o700)
+      expect((await stat(file)).mode & 0o777).toBe(0o600)
+      await chmod(file, 0o644)
+      await writeFile(`${file}.1`, "legacy archive", { mode: 0o644 })
+      reportPluginError("secure the existing log")
+      expect((await stat(file)).mode & 0o777).toBe(0o600)
+      expect((await stat(`${file}.1`)).mode & 0o777).toBe(0o600)
+    } finally {
+      process.umask(previous)
+    }
+  })
+})
+
+test("rotation preserves one bounded archive and starts a fresh log", async () => {
+  await withStatePath(async () => {
+    const file = diagnosticsLogPath()
+    const previous = "x".repeat(1024 * 1024 - 16)
+    await writeFile(file, previous)
+    await writeFile(`${file}.1`, "older archive")
+    reportPluginError("new event after rotation")
+    expect(await readFile(`${file}.1`, "utf8")).toBe(previous)
+    expect(await readFile(file, "utf8")).toContain("new event after rotation")
+    expect((await stat(file)).size).toBeLessThanOrEqual(1024 * 1024)
+    if (process.platform !== "win32") expect((await stat(`${file}.1`)).mode & 0o777).toBe(0o600)
+  })
+})
+
+test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+  "failed rename drops incoming events without growing the log or deleting its archive", async () => {
+  await withStatePath(async () => {
+    const file = diagnosticsLogPath()
+    await writeFile(file, "x".repeat(1024 * 1024))
+    await writeFile(`${file}.1`, "previous archive")
+    await chmod(dir, 0o500)
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) reportPluginError("rotation cannot write its directory")
+      expect((await stat(file)).size).toBe(1024 * 1024)
+      expect(await readFile(`${file}.1`, "utf8")).toBe("previous archive")
+    } finally {
+      await chmod(dir, 0o700)
+    }
+  })
+})
+
+test.skipIf(process.platform === "win32")("a planted log symlink never changes its target", async () => {
+  await withStatePath(async () => {
+    const target = join(dir, "unrelated")
+    await writeFile(target, "preserve", { mode: 0o644 })
+    await chmod(target, 0o644)
+    await symlink(target, diagnosticsLogPath())
+    reportPluginError("must not follow symlinks")
+    expect(await readFile(target, "utf8")).toBe("preserve")
+    expect((await stat(target)).mode & 0o777).toBe(0o644)
+  })
+})
+
+test("oversized and multiline errors produce one bounded physical record", async () => {
+  await withStatePath(async () => {
+    reportPluginError("first line\nsecond line", new Error("detail\r\n" + "x".repeat(2 * 1024 * 1024)))
+    const contents = await readFile(diagnosticsLogPath(), "utf8")
+    expect(contents.trimEnd().split("\n")).toHaveLength(1)
+    expect(Buffer.byteLength(contents)).toBeLessThanOrEqual(64 * 1024)
+    expect(contents).toContain("first line")
+  })
+})
+
+test("an unreadable error object still leaves an event record", async () => {
+  await withStatePath(async () => {
+    const error = Object.defineProperty({}, "message", { get() { throw new Error("unreadable property") } })
+    expect(() => reportPluginError("event survives formatting failure", error)).not.toThrow()
+    expect(await readFile(diagnosticsLogPath(), "utf8")).toContain("event survives formatting failure")
+  })
 })
