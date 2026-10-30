@@ -197,6 +197,8 @@ Defaults:
   the OS/JavaScript runtime locale. Unsupported explicit locales fall back to English.
 - `register_command`: `true`; registers `/goal`, `/pause_goal`, and `/resume_goal`.
 - `command_name`: `"goal"`; renames the main goal command only. The reserved names `pause_goal` and `resume_goal` fall back to `goal` so the standalone controls remain available.
+- `goalPopup`: `true`; registers the goal-state popup (the `goal.state` command, bound to <kbd>F4</kbd>). Set `false` to hand the popup and the keybinding to a separate plugin: `github:ggrabarz/opencode-goal-state-popup` is that popup, reading the same `goals.json` state file. Registered twice, F4 belongs to one of the two handlers; with this option off, the popup is not registered at all and the other plugin owns the key. The sidebar and the `goal.show` summary always belong to this plugin.
+- `goalStatusIcon`: `true`; registers the goal status glyph under the input box (`prompt.footer.status`). Set `false` to leave that slot to another plugin.
 - `restricted_agents`: `["plan"]`; agents (matched case-insensitively) treated as planning-only for goal execution.
 - `allow_goal_execution_from_plan`: `false`; when `true`, disables Plan-mode goal restrictions entirely.
 - `max_objective_chars`: `100000`; maximum Unicode code-point length of the submitted goal objective, completion evidence,

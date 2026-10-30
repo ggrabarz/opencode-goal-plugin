@@ -1319,7 +1319,12 @@ export function watchGoalStateBinding(
   return stop
 }
 
-function GoalKeymapLayerV2(api: TuiPluginV2.Context, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>) {
+function GoalKeymapLayerV2(
+  api: TuiPluginV2.Context,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+  options: { popup: boolean },
+) {
   api.keymap.layer(() => ({
     mode: "global",
     commands: [
@@ -1339,49 +1344,74 @@ function GoalKeymapLayerV2(api: TuiPluginV2.Context, messages: GoalMessages, loc
           void showSummaryV2(api, messages, locale, sessionID, goal)
         },
       },
-      {
-        id: "goal.state",
-        title: messages.tui.stateTitle,
-        description: messages.tui.stateDescription,
-        group: messages.tui.title,
-        palette: true,
-        bind: GOAL_STATE_KEYBIND,
-        run: () => {
-          void showGoalStatePopupV2(api, messages, locale)
-        },
-      },
+      // `goal.state` (F4) and the popup belong to this section. With
+      // `goalPopup: false` they are not registered at all, so the standalone
+      // popup plugin can own the keybinding without a second F4 handler.
+      ...(options.popup
+        ? [
+            {
+              id: "goal.state",
+              title: messages.tui.stateTitle,
+              description: messages.tui.stateDescription,
+              group: messages.tui.title,
+              palette: true as const,
+              bind: GOAL_STATE_KEYBIND,
+              run: () => {
+                void showGoalStatePopupV2(api, messages, locale)
+              },
+            },
+          ]
+        : []),
     ],
   }))
   // Verify the binding against the running host instead of assuming that
-  // asking for f4 means the key works.
-  onCleanup(watchGoalStateBinding(api))
+  // asking for f4 means the key works. Only this plugin's own binding is worth
+  // verifying; with the popup switched off, F4 belongs to whoever registers it.
+  if (options.popup) onCleanup(watchGoalStateBinding(api))
   return null
 }
 
 /**
  * V2 TUI setup: registers the goal sidebar via `ui.slot` and a palette command
- * through a keymap layer mounted from the global `app` slot. `keymap.layer`
- * must be invoked from a Solid component scope, so the layer lives inside a
- * component rendered by the `app` slot; its cleanup is owned by that component
- * and released automatically when the slot unmounts. The setup cleanup only
- * needs to dispose the two `ui.slot` registrations.
+ * through a keymap layer mounted from the global `app` slot. `keymap.layer` must
+ * be invoked from a Solid component scope, so the layer lives inside a component
+ * rendered by the `app` slot; its cleanup is owned by that component and released
+ * automatically when the slot unmounts. The setup cleanup only needs to dispose
+ * the `ui.slot` registrations it made.
+ *
+ * Two pieces of the UI are separable, because the popup and the status icon have
+ * no contract with this plugin beyond the state file the server writes:
+ *
+ * - `goalPopup: false` — `goal.state` and the F4 keybinding are not registered,
+ *   so `github:ggrabarz/opencode-goal-state-popup` can own them.
+ * - `goalStatusIcon: false` — `prompt.footer.status` is not registered.
+ *
+ * Both default to on, which is the behaviour every version before 0.1.85 had.
+ * The sidebar and the summary command always belong to this plugin. The V1 host
+ * path is the legacy host and is not gated.
  */
 export function setupTuiV2(context: TuiPluginV2.Context): TuiPluginV2.Cleanup {
   const locale = resolveLocale(typeof context.options?.locale === "string" ? context.options.locale : undefined)
   const messages = messagesFor(locale)
+  const popup = context.options?.goalPopup !== false
+  const statusIcon = context.options?.goalStatusIcon !== false
   const offSidebar = registerSlotV2(context, "sidebar.content", (props) =>
     GoalSidebarV2(context, messages, locale, props.sessionID),
   )
   // The status line of the input box: the icon sits under the model and the
   // thinking effort, in the one place of the prompt that a plugin owns. The
   // status slot publishes the session id as an optional value.
-  const offStatus = registerSlotV2(context, "prompt.footer.status", (props) =>
-    GoalStatusIconV2(context, (props as { sessionID?: string }).sessionID),
+  const offStatus = statusIcon
+    ? registerSlotV2(context, "prompt.footer.status", (props) =>
+        GoalStatusIconV2(context, (props as { sessionID?: string }).sessionID),
+      )
+    : null
+  const offApp = registerSlotV2(context, "app", () =>
+    GoalKeymapLayerV2(context, messages, locale, { popup }),
   )
-  const offApp = registerSlotV2(context, "app", () => GoalKeymapLayerV2(context, messages, locale))
   return () => {
     offSidebar()
-    offStatus()
+    offStatus?.()
     offApp()
   }
 }

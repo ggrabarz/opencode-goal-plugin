@@ -514,6 +514,51 @@ test("V2 setup registers sidebar.content, prompt.footer.status and app slots and
   expect(disposed.sort()).toEqual(["app", "prompt.footer.status", "sidebar.content"])
 })
 
+test("goalPopup:false registers no goal.state command, so F4 is free for the popup plugin", () => {
+  const commands = (layers: Array<() => MockKeymapLayer>) =>
+    layers.flatMap((layer) => layer().commands).filter((c): c is NonNullable<typeof c> => !!c)
+  const ids = (layers: Array<() => MockKeymapLayer>) => commands(layers).map((c) => c.id)
+  const binds = (layers: Array<() => MockKeymapLayer>) =>
+    commands(layers).map((c) => ("bind" in c ? c.bind : undefined)).filter((b) => !!b)
+
+  const on = makeMockContext()
+  setupTuiV2(on.mock as never)
+  const off = makeMockContext({ options: { goalPopup: false } })
+  setupTuiV2(off.mock as never)
+
+  // The keymap layer mounts from the `app` slot, so the layer only exists once
+  // the slot has rendered. That is the host's own ordering, and the popup option
+  // has to survive it.
+  on.slots.get("app")!({ sessionID: "ses_on" })
+  off.slots.get("app")!({ sessionID: "ses_off" })
+
+  expect(ids(on.layers)).toContain("goal.state")
+  expect(binds(on.layers)).toContain("f4")
+  expect(ids(off.layers)).not.toContain("goal.state")
+  expect(binds(off.layers)).not.toContain("f4")
+
+  // The summary command and the sidebar are this plugin's own, popup or not.
+  expect(ids(off.layers)).toContain("goal.show")
+  expect(off.slots.has("sidebar.content")).toBe(true)
+})
+
+test("goalStatusIcon:false leaves the input-box status slot to another plugin", () => {
+  const off = makeMockContext({ options: { goalStatusIcon: false } })
+  const cleanup = setupTuiV2(off.mock as never)
+
+  expect(off.slots.has("prompt.footer.status")).toBe(false)
+  expect(off.slots.has("sidebar.content")).toBe(true)
+
+  cleanup()
+  // Nothing was registered, so nothing is disposed: the cleanup must not call a
+  // disposer that was never handed out.
+  expect(off.disposed.sort()).toEqual(["app", "sidebar.content"])
+
+  const on = makeMockContext()
+  setupTuiV2(on.mock as never)
+  expect(on.slots.has("prompt.footer.status")).toBe(true)
+})
+
 test("goalStateShortcut reads the shortcut the host resolved and tolerates a dead keymap", () => {
   expect(goalStateShortcut({ keymap: { shortcuts: () => ["f4"] } })).toEqual(["f4"])
   expect(goalStateShortcut({ keymap: { shortcuts: () => [] } })).toBeNull()
