@@ -3989,3 +3989,152 @@ for (const pauseKind of ["Plan mode", "overlapping rejected blocker"]) {
     }
   }, 10_000)
 }
+
+test("V2 a failing event does not stop the event consumer", async () => {
+  const mock = makeMockContext(
+    { auto_continue: false },
+    [],
+    {},
+    { directory: "/own" },
+    { ses_v2: { location: { directory: "/own" } } },
+  )
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "keep the consumer alive")
+
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH
+  if (!stateFile) throw new Error("expected a state path")
+  await writeFile(stateFile, "{ not json", "utf8")
+  await mock.stream.push({
+    type: "session.usage.updated",
+    created: 1,
+    data: { sessionID: "ses_v2", tokens: { input: 1, output: 1 } },
+  })
+
+  await writeFile(stateFile, JSON.stringify({ version: 3, goals: {}, archives: {} }), "utf8")
+  await mock.stream.push({
+    type: "session.usage.updated",
+    created: 2,
+    data: { sessionID: "ses_after", tokens: { input: 1, output: 1 } },
+  })
+  await waitFor(() => mock.sessionGetCalls.includes("ses_after"))
+
+  expect(await readFile(join(dir, "goal-plugin.log"), "utf8")).toContain("Failed to handle a V2 event")
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 a scheduled continuation that fails is reported instead of rejecting", async () => {
+  const rejections: unknown[] = []
+  const onUnhandled = (reason: unknown) => rejections.push(reason)
+  process.on("unhandledRejection", onUnhandled)
+  const mock = makeMockContext({ min_continue_interval_seconds: 3, max_prompt_failures: 5 })
+  mock.session.prompt = async () => {
+    throw new Error("network connection failed")
+  }
+  const cleanup = await setupPlugin(mock as never)
+  try {
+    await createGoalViaV2Tool(mock, "report a failed scheduled continuation")
+    mock.stream.push({ type: "session.execution.started", created: 1, data: { sessionID: "ses_v2" } })
+    mock.stream.push({
+      type: "session.execution.failed",
+      created: 2,
+      data: { sessionID: "ses_v2", error: { message: "network connection failed" } },
+    })
+    await waitFor(async () => (await getGoal("ses_v2"))?.continuationFailures === 1)
+    await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "{ not json", "utf8")
+    await waitFor(async () => (await readFile(join(dir, "goal-plugin.log"), "utf8").catch(() => "")).includes("Scheduled continuation failed"), 8000)
+    expect(rejections).toHaveLength(0)
+  } finally {
+    process.off("unhandledRejection", onUnhandled)
+    mock.stream.end()
+    await cleanup()
+  }
+}, 10_000)
+
+test("V2 a failing tool hook does not fail the tool call", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const before = mock.hooks["execute.before"]
+  const after = mock.hooks["execute.after"]
+  expect(before).toBeDefined()
+  expect(after).toBeDefined()
+  await before!({ tool: "bash", sessionID: "ses_v2", id: "call_1" } as never)
+  await after!({ tool: "bash", sessionID: "ses_v2", id: "call_1", status: "completed", result: { output: "done" } } as never)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 a failing session hook does not reject the hook", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  const stateFile = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(stateFile, "{ not json", "utf8")
+
+  const compaction = mock.hooks["compaction"]
+  expect(compaction).toBeDefined()
+  await compaction!({ sessionID: "ses_v2", system: [] } as never)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 bookkeeping failures preserve host result and explicit pause failures", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  await setupPlugin(mock as never)
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "{ not json", "utf8")
+  const result = { content: "existing output", metadata: { provider: "host" } }
+  const input = { tool: "read", sessionID: "ses_v2", id: "read_1", status: "completed", result }
+  await mock.hooks["execute.after"]!(input)
+  expect(input.result).toBe(result)
+  expect(result).toEqual({ content: "existing output", metadata: { provider: "host" } })
+  const failed = { ...input, status: "failed", error: new Error("provider failure") }
+  await mock.hooks["execute.after"]!(failed)
+  expect(failed.error.message).toBe("provider failure")
+  const pause = mock.commands.find((command) => command.name === "pause_goal")!
+  expect(pause).toBeDefined()
+  await expect(pause.execute({ sessionID: "ses_v2", prompt: { text: "" }, delivery: "queue" })).rejects.toThrow()
+  const v1 = await plugin.server({ client: {} } as never, { auto_continue: false })
+  const config = {} as { command?: Record<string, { template: string }> }
+  await v1.config!(config as never)
+  await expect(mock.hooks.prompt!({ sessionID: "ses_v2", prompt: { text: config.command!.pause_goal!.template } })).rejects.toThrow()
+  await v1.dispose?.()
+  await expect(goalTool(mock, "create_goal").execute({ objective: "must persist" }, toolContext())).rejects.toThrow()
+  expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe("{ not json")
+})
+
+test("V2 a failed tool-start read cannot clear a later continuation attempt", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "preserve the later attempt")
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const original = await readFile(file, "utf8")
+  await writeFile(file, "{ not json", "utf8")
+  await mock.hooks["execute.before"]!({ tool: "read", sessionID: "ses_v2", id: "old" })
+  await writeFile(file, original, "utf8")
+  const reserved = await reserveContinuation("ses_v2", 5, 0)
+  await mock.hooks["execute.after"]!({ tool: "read", sessionID: "ses_v2", id: "old", status: "completed", result: { content: "old output" } })
+  expect((await getGoalInternal("ses_v2"))?.pendingAttempt?.id).toBe(reserved?.pendingAttempt?.id)
+})
+
+test("V2 a failed user-interrupt write cannot resume the aborted goal on a later execution", async () => {
+  const mock = makeMockContext({ min_continue_interval_seconds: 0 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "stop on user interruption")
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const original = await readFile(file, "utf8")
+  await writeFile(file, "{ not json", "utf8")
+  void mock.stream.push({ type: "session.execution.interrupted", created: 1, data: { sessionID: "ses_v2", reason: "user" } })
+  await waitFor(async () => (await readFile(join(dir, "goal-plugin.log"), "utf8").catch(() => "")).includes("StateDecodeError"))
+  await writeFile(file, original, "utf8")
+  void mock.stream.push({ type: "session.execution.started", created: 2, data: { sessionID: "ses_v2" } })
+  void mock.stream.push({ type: "session.execution.succeeded", created: 3, data: { sessionID: "ses_v2" } })
+  await Bun.sleep(150)
+  expect(mock.promptCalls).toHaveLength(0)
+  expect(await readFile(join(dir, "goal-plugin.log"), "utf8")).toContain("V2 event consumer stopped")
+  mock.stream.end()
+  await cleanup()
+})

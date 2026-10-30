@@ -1,4 +1,4 @@
-import type { Config, Plugin } from "@opencode-ai/plugin"
+import type { Config, Hooks, Plugin } from "@opencode-ai/plugin"
 import type * as PluginV2 from "@opencode/plugin"
 import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
 import type { Tool as ToolSchema } from "@opencode/schema/tool"
@@ -1829,6 +1829,8 @@ const server: Plugin = async ({ client }, options?: Options) => {
         }
         if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID)) return
         await runAutoContinue(sessionID, true, scheduled)
+      } catch (error) {
+        reportPluginError("Scheduled continuation failed", error)
       } finally {
         if (scheduledContinuations.get(sessionID) === scheduled) scheduledContinuations.delete(sessionID)
       }
@@ -2125,7 +2127,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
     }
   }
 
-  return {
+  const hooks: Hooks & { dispose(): Promise<void> } = {
     async dispose() {
       disposed = true
       continuationEpochs.dispose()
@@ -2139,7 +2141,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       nativeRetrySessions.clear()
       toolAttempts.clear()
       explicitResumeRequests.clear()
-    objectiveEdits.clear()
+      objectiveEdits.clear()
     },
     async config(config) {
       if (!registerCommand) return
@@ -2293,6 +2295,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
       const callID = typeof input?.callID === "string" ? input.callID : undefined
       if (sessionID && callID) {
+        toolAttempts.set(toolAttemptKey(sessionID, callID), null)
         const goal = await getGoalInternal(sessionID)
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
       }
@@ -2529,6 +2532,28 @@ const server: Plugin = async ({ client }, options?: Options) => {
       if (!autoContinue && (await getGoalInternal(sessionID))?.pendingAttempt == null) return
       await runAutoContinue(sessionID)
     },
+  }
+  hooks["tool.execute.before"] = isolateBookkeeping("tool.execute.before", hooks["tool.execute.before"]!)
+  hooks["tool.execute.after"] = isolateBookkeeping("tool.execute.after", hooks["tool.execute.after"]!)
+  hooks["chat.message"] = isolateBookkeeping("chat.message", hooks["chat.message"]!)
+  hooks["experimental.chat.messages.transform"] = isolateBookkeeping("chat.messages.transform", hooks["experimental.chat.messages.transform"]!)
+  hooks["experimental.session.compacting"] = isolateBookkeeping("session.compacting", hooks["experimental.session.compacting"]!)
+  const eventHook = hooks.event!
+  const bookkeepingEvent = isolateBookkeeping("event", eventHook)
+  hooks.event = (input) => isUserAbortEvent(input.event as never) ? eventHook(input) : bookkeepingEvent(input)
+  return hooks
+}
+
+function isolateBookkeeping<TArgs extends unknown[]>(
+  name: string,
+  callback: (...args: TArgs) => Promise<void>,
+): (...args: TArgs) => Promise<void> {
+  return async (...args) => {
+    try {
+      await callback(...args)
+    } catch (error) {
+      reportPluginError(`Failed to run ${name}`, error)
+    }
   }
 }
 
@@ -2784,6 +2809,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         }
         if (scheduledContinuations.get(sessionID) !== scheduled || nativeRetrySessions.has(sessionID)) return
         await runAutoContinue(sessionID, true, scheduled)
+      } catch (error) {
+        reportPluginError("Scheduled continuation failed", error)
       } finally {
         if (scheduledContinuations.get(sessionID) === scheduled) scheduledContinuations.delete(sessionID)
       }
@@ -3693,7 +3720,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   )
 
   let tracksToolEnds = false
-  const tracksToolStarts = await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", async (input) => {
+  const tracksToolStarts = await registerSafely("the execute.before hook", () => context.tool.hook("execute.before", isolateBookkeeping("execute.before", async (input) => {
       if (!tracksToolEnds) return
       taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id })
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
@@ -3701,14 +3728,15 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (sessionID) markSessionOwnership(sessionID, true)
       const callID = typeof input.id === "string" ? input.id : undefined
       if (sessionID && callID) {
+        toolAttempts.set(toolAttemptKey(sessionID, callID), null)
         const goal = await getGoalInternal(sessionID)
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
       }
-    }),
+    })),
     true,
   )
 
-  tracksToolEnds = await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", async (input) => {
+  tracksToolEnds = await registerSafely("the execute.after hook", () => context.tool.hook("execute.after", isolateBookkeeping("execute.after", async (input) => {
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
       const callID = typeof input.id === "string" ? input.id : undefined
       const attemptKey = sessionID && callID ? toolAttemptKey(sessionID, callID) : undefined
@@ -3749,7 +3777,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         locallyDeliveredPendingSessions.delete(sessionID)
         cancelScheduledContinuation(sessionID)
       }
-    }),
+    })),
     true,
   )
 
@@ -3776,13 +3804,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       name: "compaction",
       callback: (event: V2CompactionHookEvent) => Promise<void>,
     ) => Promise<{ dispose(): Promise<void> }>
-    await registerSafely("the compaction hook", () => hookCompaction("compaction", async (event) => {
+    await registerSafely("the compaction hook", () => hookCompaction("compaction", isolateBookkeeping("compaction", async (event) => {
         ensureSystemReminder(event.system)
         const goal = await getGoal(event.sessionID)
         if (!goal) return
         if (event.system.some((part) => part.type === "text" && part.text.startsWith(compactionContextPrefix(locale)))) return
         event.system.push({ type: "text", text: compactionContext(goal, locale) })
-      }),
+      })),
     )
   } catch {
     // Host predates the session compaction hook.
@@ -3830,7 +3858,14 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         const { done, value } = await iterator.next()
         if (done) break
         const event = decodeV2Event(value)
-        if (event) await handleV2Event(event)
+        if (event) {
+          try {
+            await handleV2Event(event)
+          } catch (error) {
+            if (event.type === "session.execution.interrupted" && event.data.reason === "user") throw error
+            reportPluginError("Failed to handle a V2 event", error)
+          }
+        }
       }
     } catch (error) {
       if (!abortController.signal.aborted) v2ErrorLog("V2 event consumer stopped", error)
