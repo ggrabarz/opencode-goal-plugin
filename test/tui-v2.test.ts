@@ -767,3 +767,37 @@ test("V2 palette command toasts a warning when no session is open", async () => 
     cleanup()
   }
 })
+
+
+for (const failure of ["dialog.set", "dialog.select", "session.prompt", "toast.show"]) {
+  test(`V2 palette command contains ${failure} failures`, async () => {
+    const { mock, slots, layers, setRoute, promptCalls, toasts } = makeMockContext()
+    const error = new Error(`failed ${failure}`)
+    if (failure === "dialog.set") mock.ui.dialog.set = () => { throw error }
+    mock.ui.dialog.select = async () => {
+      if (failure === "dialog.select" || failure === "toast.show") throw error
+      return "refresh"
+    }
+    if (failure === "session.prompt") mock.client.session.prompt = async () => { throw error }
+    if (failure === "toast.show") mock.ui.toast.show = () => { throw new Error("toast failed") }
+    setRoute({ type: "session", sessionID: "ses_v2" })
+    const cleanup = setupTuiV2(mock as never)
+    const app = slots.get("app")
+    const setup = await testRender(() => app?.({ sessionID: "" }) as never, { width: 80, height: 20 })
+    try {
+      await setup.renderOnce()
+      const command = layers[0]?.()?.commands?.find((candidate) => candidate.id === "goal.show")
+      expect(command).toBeDefined()
+      await command?.run()
+      if (failure !== "toast.show") {
+        expect(toasts).toHaveLength(1)
+        expect(toasts[0]?.message).toBe(error.message)
+        expect(toasts[0]?.variant).toBe("error")
+      }
+      expect(promptCalls).toHaveLength(0)
+    } finally {
+      setup.renderer.destroy()
+      cleanup()
+    }
+  })
+}
