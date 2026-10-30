@@ -42,18 +42,65 @@ function matchesDependency(specifier: string, dependency: string) {
   return specifier === dependency || specifier.startsWith(`${dependency}/`)
 }
 
-test("runtime imports are covered by dependencies or peerDependencies", () => {
+// Packages the bundler inlines into `dist/server.js`. They are imported by the
+// sources, so the source-level guard below has to skip them, but they must stay
+// declared as devDependencies so the bundler keeps resolving them and the built
+// entrypoint stays self-contained.
+//
+// `effect` is the reason a `github:` install used to fail: as a runtime
+// dependency it pulls `msgpackr-extract`, whose node-gyp postinstall is blocked
+// by this box's npm script policy, and npm reports the whole git preparation as
+// "git dep preparation failed". Bundling it removes the native postinstall from
+// the install path entirely.
+const BUNDLED_DEV_DEPENDENCIES = ["effect-goal-state"]
+
+test("runtime imports are covered by dependencies, peerDependencies, or the bundle", () => {
   const packageJson = readPackageJson()
   const dependencies = Object.keys(packageJson.dependencies ?? {})
   const peerDependencies = Object.keys(packageJson.peerDependencies ?? {})
+  const devDependencies = Object.keys(packageJson.devDependencies ?? {})
 
   for (const { specifier, typeOnly } of collectImports()) {
     if (typeOnly) continue
+    if (BUNDLED_DEV_DEPENDENCIES.includes(specifier)) {
+      // Bundled, so the dev dependency must exist and it must not also be a
+      // runtime dependency, or npm installs the native tree again.
+      expect(devDependencies).toContain(specifier)
+      expect(dependencies).not.toContain(specifier)
+      continue
+    }
     const covered = [...dependencies, ...peerDependencies].some((dependency) =>
       matchesDependency(specifier, dependency),
     )
     expect({ specifier, covered }).toEqual({ specifier, covered: true })
   }
+})
+
+test("the built entrypoint imports only declared runtime dependencies", () => {
+  const packageJson = readPackageJson()
+  const allowed = new Set([
+    ...Object.keys(packageJson.dependencies ?? {}),
+    ...Object.keys(packageJson.peerDependencies ?? {}),
+  ])
+  const builtins = new Set(["crypto", "fs", "fs/promises", "os", "path", "url", "util", "events", "stream", "child_process", "net", "http", "https", "tls", "zlib", "assert", "buffer", "process", "string_decoder", "querystring"])
+
+  const text = readFileSync("dist/server.js", "utf8")
+  const specifiers = new Set<string>()
+  for (const match of text.matchAll(/(?:^|\n)\s*(?:import|export)[\s\S]*?from\s+"([^"]+)"/g)) {
+    specifiers.add(match[1]!)
+  }
+  for (const match of text.matchAll(/import\(\s*"([^"]+)"\s*\)/g)) {
+    specifiers.add(match[1]!)
+  }
+
+  for (const specifier of specifiers) {
+    const name = specifier.startsWith("@") ? specifier.split("/").slice(0, 2).join("/") : specifier.split("/")[0]!
+    const ok = builtins.has(specifier) || builtins.has(name) || allowed.has(specifier) || allowed.has(name)
+    expect({ specifier, ok }).toEqual({ specifier, ok: true })
+  }
+
+  // The bundler must not leave the aliased effect import as a runtime import.
+  expect(specifiers).not.toContain("effect-goal-state")
 })
 
 test("declared dependencies are all used at runtime", () => {
