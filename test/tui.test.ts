@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
 import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -7,7 +7,7 @@ import plugin, { formatDuration, formatGoal, goalStateFromSession, liveTimeUsedS
 import { atomicWriteFile } from "../src/atomic-write"
 import { messagesFor } from "../src/i18n"
 
-const previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
+let previousStatePath: string | undefined
 const isolatedStateDir = mkdtempSync(join(tmpdir(), "goal-tui-v1-"))
 const isolatedStatePath = join(isolatedStateDir, "goals.json")
 
@@ -17,10 +17,11 @@ async function writeGoalState(value: unknown) {
 }
 
 beforeAll(() => {
-  process.env.OPENCODE_GOAL_STATE_PATH = isolatedStatePath
 })
 
 beforeEach(() => {
+  previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
+  process.env.OPENCODE_GOAL_STATE_PATH = isolatedStatePath
   try {
     unlinkSync(isolatedStatePath)
   } catch (error) {
@@ -28,9 +29,12 @@ beforeEach(() => {
   }
 })
 
-afterAll(() => {
+afterEach(() => {
   if (previousStatePath === undefined) delete process.env.OPENCODE_GOAL_STATE_PATH
   else process.env.OPENCODE_GOAL_STATE_PATH = previousStatePath
+})
+
+afterAll(() => {
   rmSync(isolatedStateDir, { recursive: true, force: true })
 })
 

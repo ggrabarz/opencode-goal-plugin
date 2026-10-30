@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test"
 import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
 import { writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -21,7 +21,7 @@ import { atomicWriteFile } from "../src/atomic-write"
 
 type GoalSnapshot = Parameters<typeof liveTimeUsedSeconds>[0]
 
-const previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
+let previousStatePath: string | undefined
 const isolatedStateDir = mkdtempSync(join(tmpdir(), "goal-tui-v2-"))
 const isolatedStatePath = join(isolatedStateDir, "goals.json")
 let hostTheme: ResolvedTheme | undefined
@@ -32,7 +32,6 @@ async function writeGoalState(value: unknown) {
 }
 
 beforeAll(async () => {
-  process.env.OPENCODE_GOAL_STATE_PATH = isolatedStatePath
   if (process.env.OPENCODE_TEST_HOST_THEME === "1") {
     const { resolvedHostTheme } = await import("./fixtures/host-theme")
     hostTheme = resolvedHostTheme()
@@ -40,6 +39,8 @@ beforeAll(async () => {
 })
 
 beforeEach(() => {
+  previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
+  process.env.OPENCODE_GOAL_STATE_PATH = isolatedStatePath
   try {
     unlinkSync(isolatedStatePath)
   } catch (error) {
@@ -47,9 +48,12 @@ beforeEach(() => {
   }
 })
 
-afterAll(() => {
+afterEach(() => {
   if (previousStatePath === undefined) delete process.env.OPENCODE_GOAL_STATE_PATH
   else process.env.OPENCODE_GOAL_STATE_PATH = previousStatePath
+})
+
+afterAll(() => {
   rmSync(isolatedStateDir, { recursive: true, force: true })
 })
 
