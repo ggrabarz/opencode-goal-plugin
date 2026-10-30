@@ -23,6 +23,8 @@ let pending: Promise<void>
 afterEach(async () => { await pending })
 test("late state write after fixture cleanup stays isolated", async () => {
   const fallback = process.env.OPENCODE_GOAL_STATE_PATH!
+  await createGoal("early", "preload protected explicit caller path", null)
+  expect(JSON.parse(await readFile(fallback, "utf8")).goals.early.objective).toBe("preload protected explicit caller path")
   const fixture = await mkdtemp(join(${JSON.stringify(dir)}, "fixture-"))
   process.env.OPENCODE_GOAL_STATE_PATH = join(fixture, "goals.json")
   pending = new Promise((done, reject) => setTimeout(async () => {
