@@ -1,7 +1,7 @@
 {
   "name": "@prevalentware/opencode-goal-plugin",
   "version": "0.1.2",
-  "description": "Goal-mode plugin for OpenCode (self-contained build). The goal-state popup and the input-box status icon are opt-out: goalPopup / goalStatusIcon. TUI-only popup: github:ggrabarz/opencode-goal-state-popup",
+  "description": "OpenCode goal plugin that adds Codex-style long-running goal mode, /goal commands, persistence, and TUI status for AI coding agents.",
   "type": "module",
   "main": "./dist/server.js",
   "exports": {
@@ -34,6 +34,7 @@
     "dist",
     "src/tui.ts",
     "src/i18n.ts",
+    "src/diagnostics.ts",
     "src/state-path.ts",
     "LICENSE",
     "README.md"
