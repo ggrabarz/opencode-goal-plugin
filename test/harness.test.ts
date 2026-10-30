@@ -12,7 +12,6 @@ test("preload protects caller state and late callbacks after fixture cleanup", a
     await mkdir(join(callerData, "opencode-goal-plugin"), { recursive: true })
     await writeFile(callerState, "explicit sentinel")
     await writeFile(defaultState, "default sentinel")
-    await writeFile(join(dir, "bunfig.toml"), `[test]\npreload = [${JSON.stringify(resolve("test/setup.ts"))}]\n`)
     await writeFile(join(dir, "probe.test.ts"), `
 import { afterEach, expect, test } from "bun:test"
 import { mkdtemp, rm, readFile } from "node:fs/promises"
@@ -43,8 +42,8 @@ test("late state write after fixture cleanup stays isolated", async () => {
   await rm(fixture, { recursive: true, force: true })
 })
 `)
-    const child = Bun.spawn([process.execPath, "test", "probe.test.ts"], {
-      cwd: dir,
+    const child = Bun.spawn([process.execPath, "test", join(dir, "probe.test.ts")], {
+      cwd: process.cwd(),
       env: { ...process.env, HOME: dir, XDG_DATA_HOME: callerData, OPENCODE_GOAL_STATE_PATH: callerState },
       stdout: "pipe",
       stderr: "pipe",
@@ -60,8 +59,8 @@ test("late state write after fixture cleanup stays isolated", async () => {
 import { createGoal } from ${JSON.stringify(resolve("src/state.ts"))}
 await createGoal("worker", "explicit worker state", null)
 `)
-    const worker = Bun.spawn([process.execPath, "run", "worker.ts"], {
-      cwd: dir,
+    const worker = Bun.spawn([process.execPath, "run", join(dir, "worker.ts")], {
+      cwd: process.cwd(),
       env: { ...process.env, HOME: dir, XDG_DATA_HOME: callerData, OPENCODE_GOAL_STATE_PATH: workerState },
       stdout: "ignore",
       stderr: "pipe",
