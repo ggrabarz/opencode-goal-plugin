@@ -1,0 +1,1233 @@
+import type { TuiCommand, TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import type { Plugin as TuiPluginV2 } from "@opencode/plugin/tui"
+import type { SessionMessageInfo } from "@opencode/client"
+import { createElement, insert, setProp } from "@opentui/solid"
+import { createEffect, createMemo, createRoot, createSignal, onCleanup } from "solid-js"
+import { readFile, stat } from "node:fs/promises"
+import type { GoalMessages } from "./i18n"
+import { messagesFor, presentGoalLastStatus, presentGoalStatus, presentGoalStopReason, resolveLocale } from "./i18n"
+import { statePath } from "./state-path"
+
+type GoalCheckpoint = {
+  summary: string
+  timestamp: number
+}
+
+type GoalHistoryEntry = {
+  type: string
+  detail: string
+  timestamp: number
+}
+
+export type GoalStatus = "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet" | "cancelled"
+
+type GoalSnapshot = {
+  sessionID: string
+  objective: string
+  status: GoalStatus
+  tokenBudget: number | null
+  tokensUsed: number
+  timeUsedSeconds: number
+  createdAt: number
+  updatedAt: number
+  completionEvidence?: string | null
+  blocker?: string | null
+  closedAt?: number | null
+  continuationFailures: number
+  lastStatus: string | null
+  maxAutoTurns: number | null
+  maxDurationSeconds: number | null
+  noProgressTokenThreshold: number | null
+  maxNoProgressTurns: number | null
+  noProgressTurns: number
+  budgetWrapupSent: boolean
+  stopReason: string | null
+  history: GoalHistoryEntry[]
+  checkpoints: GoalCheckpoint[]
+  lastCheckpoint: GoalCheckpoint | null
+  lastAssistantText: string
+  lastAssistantMessageID: string
+  autoTurns: number
+  lastContinuationAt: number | null
+  remainingTokens: number | null
+  sampledAt?: number
+}
+
+type GoalToolPart = {
+  type: string
+  tool?: string
+  state?: {
+    status?: string
+    output?: string
+  }
+  tokens?: unknown
+}
+
+type SessionMessage = {
+  id: string
+}
+
+type GoalSessionState = {
+  goal: GoalSnapshot | null
+  messageIndex: number
+}
+type ElementChild = string | number | boolean | null | undefined | object | (() => ElementChild)
+
+type ModernTuiApi = TuiPluginApi & {
+  keymap?: {
+    registerLayer?: (layer: {
+      commands: {
+        namespace: string
+        name: string
+        title: string
+        desc?: string
+        category?: string
+        run?: () => void
+      }[]
+      bindings?: unknown[]
+    }) => () => void
+  }
+}
+
+const goalCache = new Map<string, GoalSnapshot>()
+
+const GOAL_TOOL_NAMES: readonly string[] = [
+  "get_goal",
+  "get_goal_history",
+  "create_goal",
+  "set_goal",
+  "update_goal",
+  "update_goal_objective",
+  "update_goal_status",
+  "stop_goal",
+  "replace_goal",
+  "clear_goal",
+]
+
+/**
+ * The glyph that stands for each goal status.
+ *
+ * Every status gets its own plain text glyph. None of them is an emoji: each
+ * one is a text presentation character on its own, so the icon reads the same
+ * in a terminal, in the host's TUI and in a font that has no emoji at all.
+ */
+export const GOAL_STATUS_GLYPHS: Readonly<Record<GoalStatus, string>> = {
+  active: "▶", // U+25B6 BLACK RIGHT-POINTING TRIANGLE
+  paused: "‖", // U+2016 DOUBLE VERTICAL LINE
+  budgetLimited: "⚠", // U+26A0 WARNING SIGN
+  usageLimited: "⌛", // U+231B HOURGLASS
+  complete: "✓", // U+2713 CHECK MARK
+  unmet: "✗", // U+2717 BALLOT X
+  cancelled: "⊗", // U+2297 CIRCLED TIMES
+}
+
+/** The glyph for a goal status. An unknown status reads as running. */
+export function goalStatusGlyph(status: GoalStatus): string {
+  return GOAL_STATUS_GLYPHS[status] ?? GOAL_STATUS_GLYPHS.active
+}
+
+/**
+ * The key that opens the goal state popup.
+ *
+ * The local OpenRouter limits plugin owns f3, the host binds f2 for model
+ * cycling, and nothing else claims f4. The command has an id, so the key can
+ * be changed in the OpenCode configuration like any other keybind.
+ */
+export const GOAL_STATE_KEYBIND = "f4"
+
+function element(tag: string, props: Record<string, unknown>, children: ElementChild[] = []) {
+  const node = createElement(tag)
+  for (const [key, value] of Object.entries(props)) if (value !== undefined) setProp(node, key, value)
+  for (const child of children) if (child !== null && child !== undefined && child !== false) insert(node, child)
+  return node
+}
+
+function text(props: Record<string, unknown>, children: ElementChild[]) {
+  return element("text", props, children)
+}
+
+function box(props: Record<string, unknown>, children: ElementChild[] = []) {
+  return element("box", props, children)
+}
+
+type SlotRender = (props: { sessionID: string }) => unknown
+type SlotDispose = () => void
+
+const noopDispose: SlotDispose = () => {}
+
+/**
+ * Registers a V2 TUI slot across both plugin-context generations.
+ *
+ * Early V2 previews exposed `ui.slot(name, render)`. Current previews expose a
+ * single options argument, `ui.slot({ append, render })`, and silently register
+ * nothing when handed the positional pair — which is how the goal sidebar and
+ * the palette keymap layer both disappeared. Branch on the callback arity so
+ * either host works, and tolerate hosts that return no disposer.
+ */
+export function registerSlotV2(context: TuiPluginV2.Context, name: string, render: SlotRender): SlotDispose {
+  const slot = context.ui.slot as unknown as (...args: unknown[]) => unknown
+  const dispose = slot.length <= 1 ? slot({ append: name, render }) : slot(name, render)
+  return typeof dispose === "function" ? (dispose as SlotDispose) : noopDispose
+}
+
+/**
+ * Reads a theme color by trying each candidate path in order, descending into a
+ * `base` or `default` leaf when the resolved node is a color group.
+ *
+ * Stable V2 uses `text.base` and `text.muted`; previews use `text.default` and
+ * `text.subdued`, while earlier previews and the V1 TUI expose flat
+ * keys (`text`, `textMuted`, `primary`). Passing a color *group* as `fg`
+ * renders nothing useful, so resolve to a leaf before handing it to OpenTUI.
+ */
+export function themeColorV2(theme: unknown, ...paths: readonly (readonly string[])[]): unknown {
+  for (const path of paths) {
+    let cursor: unknown = theme
+    for (const key of path) {
+      if (cursor === null || typeof cursor !== "object") {
+        cursor = undefined
+        break
+      }
+      cursor = (cursor as Record<string, unknown>)[key]
+    }
+    if (cursor !== null && typeof cursor === "object") {
+      if ("base" in cursor) cursor = cursor.base
+      else if ("default" in cursor) cursor = cursor.default
+    }
+    if (cursor !== undefined && cursor !== null) return cursor
+  }
+  return undefined
+}
+
+function goalColorsV2(theme: unknown) {
+  return {
+    text: themeColorV2(theme, ["text", "base"], ["text", "default"], ["text"]),
+    muted: themeColorV2(theme, ["text", "muted"], ["text", "subdued"], ["textMuted"]),
+    achieved: themeColorV2(theme, ["text", "feedback", "success"], ["primary"], ["text", "base"], ["text", "default"], ["text"]),
+  }
+}
+
+/**
+ * The colour that stands for a goal status in the input box.
+ *
+ * The status is told by the glyph; the colour tells it at a glance: a goal
+ * that runs is bright, a goal that waits is muted, a goal that hit a limit
+ * warns and a goal that failed is an error.
+ */
+export function goalStatusColorV2(status: GoalStatus, theme: unknown) {
+  if (status === "active") return themeColorV2(theme, ["text", "base"], ["text", "default"], ["text"])
+  if (status === "complete")
+    return themeColorV2(theme, ["text", "feedback", "success"], ["primary"], ["text", "base"], ["text", "default"], ["text"])
+  if (status === "unmet") return themeColorV2(theme, ["text", "feedback", "error"], ["error"], ["text", "base"], ["text", "default"], ["text"])
+  if (status === "budgetLimited" || status === "usageLimited")
+    return themeColorV2(theme, ["text", "feedback", "warning"], ["warning"], ["text", "base"], ["text", "default"], ["text"])
+  return themeColorV2(theme, ["text", "muted"], ["text", "subdued"], ["textMuted"])
+}
+
+/** The V1 counterpart of the input box status colour. */
+export function goalStatusColorV1(status: GoalStatus, theme: { text: unknown; textMuted: unknown; warning: unknown; success: unknown; error: unknown }) {
+  if (status === "active") return theme.text
+  if (status === "complete") return theme.success
+  if (status === "unmet") return theme.error
+  if (status === "budgetLimited" || status === "usageLimited") return theme.warning
+  return theme.textMuted
+}
+
+function goalSnapshotKey(sessionID: string) {
+  return `goal-mode.snapshot.${sessionID}`
+}
+
+function cachedGoal(api: TuiPluginApi, sessionID: string) {
+  const memory = goalCache.get(sessionID)
+  if (memory) return memory
+  const persisted = api.kv?.get(goalSnapshotKey(sessionID), null)
+  return isGoalSnapshot(persisted) ? persisted : null
+}
+
+function cacheGoal(api: TuiPluginApi, sessionID: string, goal: GoalSnapshot | null) {
+  if (goal) {
+    goalCache.set(sessionID, goal)
+    api.kv?.set(goalSnapshotKey(sessionID), goal)
+    return
+  }
+  goalCache.delete(sessionID)
+  api.kv?.set(goalSnapshotKey(sessionID), null)
+}
+
+function currentSessionID(api: TuiPluginApi) {
+  const route = api.route.current
+  if (route.name !== "session") return undefined
+  const sessionID = route.params?.sessionID
+  return typeof sessionID === "string" ? sessionID : undefined
+}
+
+function toast(
+  api: TuiPluginApi,
+  messages: GoalMessages,
+  message: string,
+  variant: "info" | "success" | "warning" | "error" = "info",
+) {
+  api.ui.toast({ title: messages.tui.title, message, variant, duration: 2500 })
+}
+
+async function sendGoalPrompt(api: TuiPluginApi, sessionID: string, text: string) {
+  await api.client.session.promptAsync({
+    sessionID,
+    parts: [{ type: "text", text }],
+  })
+}
+
+function refreshGoalPrompt(messages: GoalMessages) {
+  return messages.tui.refreshPrompt
+}
+
+function clearGoalPrompt(messages: GoalMessages) {
+  return messages.tui.clearPrompt
+}
+
+function pauseGoalPrompt(messages: GoalMessages) {
+  return messages.tui.pausePrompt
+}
+
+function resumeGoalPrompt(messages: GoalMessages) {
+  return messages.tui.resumePrompt
+}
+
+function historyGoalPrompt(messages: GoalMessages) {
+  return messages.tui.historyPrompt
+}
+
+function actionOption(
+  api: TuiPluginApi,
+  messages: GoalMessages,
+  sessionID: string,
+  title: string,
+  value: string,
+  description: string,
+  prompt: string,
+) {
+  return {
+    title,
+    value,
+    description,
+    onSelect: () => {
+      void sendGoalPrompt(api, sessionID, prompt)
+        .then(() => api.ui.dialog.clear())
+        .catch((error) => toast(api, messages, error instanceof Error ? error.message : String(error), "error"))
+    },
+  }
+}
+
+function showSummary(
+  api: TuiPluginApi,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+  sessionID: string,
+  goal: GoalSnapshot | null,
+) {
+  const DialogSelect = api.ui.DialogSelect
+  const options = [
+    actionOption(
+      api,
+      messages,
+      sessionID,
+      messages.tui.refresh,
+      "refresh",
+      messages.tui.refreshDescription,
+      refreshGoalPrompt(messages),
+    ),
+    ...(goal
+      ? [
+          actionOption(
+            api,
+            messages,
+            sessionID,
+            messages.tui.history,
+            "history",
+            messages.tui.historyDescription,
+            historyGoalPrompt(messages),
+          ),
+          ...(goal.status === "active"
+            ? [
+                actionOption(
+                  api,
+                  messages,
+                  sessionID,
+                  messages.tui.pause,
+                  "pause",
+                  messages.tui.pauseDescription,
+                  pauseGoalPrompt(messages),
+                ),
+              ]
+            : []),
+          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited"
+            ? [
+                actionOption(
+                  api,
+                  messages,
+                  sessionID,
+                  messages.tui.resume,
+                  "resume",
+                  messages.tui.resumeDescription,
+                  resumeGoalPrompt(messages),
+                ),
+              ]
+            : []),
+          actionOption(
+            api,
+            messages,
+            sessionID,
+            messages.tui.clear,
+            "clear",
+            messages.tui.clearDescription,
+            clearGoalPrompt(messages),
+          ),
+        ]
+      : []),
+  ]
+
+  api.ui.dialog.setSize("large")
+  api.ui.dialog.replace(() =>
+    DialogSelect({
+      title: messages.tui.title,
+      placeholder: formatGoal(goal, messages, locale),
+      options,
+      onSelect(option) {
+        option.onSelect?.()
+      },
+    }),
+  )
+}
+
+function sessionIDOrToast(api: TuiPluginApi, messages: GoalMessages) {
+  const sessionID = currentSessionID(api)
+  if (!sessionID) toast(api, messages, messages.tui.openSession, "warning")
+  return sessionID
+}
+
+export function formatDuration(seconds: number) {
+  const total = Math.max(0, Math.floor(seconds))
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const secs = total % 60
+  const paddedSecs = String(secs).padStart(2, "0")
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${paddedSecs}`
+  return `${minutes}:${paddedSecs}`
+}
+
+function formatDurationBadge(seconds: number) {
+  return formatDuration(seconds)
+}
+
+function currentEpochSeconds() {
+  return Math.floor(Date.now() / 1000)
+}
+
+export function liveTimeUsedSeconds(goal: GoalSnapshot, nowSeconds = currentEpochSeconds()) {
+  const baseSeconds = Math.max(0, Math.floor(goal.timeUsedSeconds))
+  if (goal.status !== "active") return baseSeconds
+  if (typeof goal.sampledAt !== "number") return baseSeconds
+  return baseSeconds + Math.max(0, Math.floor(nowSeconds - goal.sampledAt))
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function isCheckpoint(value: unknown): value is GoalCheckpoint {
+  return isRecord(value) && typeof value.summary === "string" && typeof value.timestamp === "number"
+}
+
+function isHistoryEntry(value: unknown): value is GoalHistoryEntry {
+  return isRecord(value) && typeof value.type === "string" && typeof value.detail === "string" && typeof value.timestamp === "number"
+}
+
+function isGoalSnapshot(value: unknown): value is GoalSnapshot {
+  if (!isRecord(value)) return false
+  if (typeof value.sessionID !== "string") return false
+  if (typeof value.objective !== "string") return false
+  if (!["active", "paused", "budgetLimited", "usageLimited", "complete", "unmet", "cancelled"].includes(String(value.status))) return false
+  if (value.tokenBudget !== null && typeof value.tokenBudget !== "number") return false
+  if (typeof value.tokensUsed !== "number") return false
+  if (typeof value.timeUsedSeconds !== "number") return false
+  if (typeof value.createdAt !== "number") return false
+  if (typeof value.updatedAt !== "number") return false
+  if (value.completionEvidence != null && typeof value.completionEvidence !== "string") return false
+  if (value.blocker != null && typeof value.blocker !== "string") return false
+  if (value.closedAt != null && typeof value.closedAt !== "number") return false
+  if (typeof value.continuationFailures !== "number") return false
+  if (value.lastStatus != null && typeof value.lastStatus !== "string") return false
+  if (value.maxAutoTurns !== null && typeof value.maxAutoTurns !== "number") return false
+  if (value.maxDurationSeconds !== null && typeof value.maxDurationSeconds !== "number") return false
+  if (value.noProgressTokenThreshold !== null && typeof value.noProgressTokenThreshold !== "number") return false
+  if (value.maxNoProgressTurns !== null && typeof value.maxNoProgressTurns !== "number") return false
+  if (typeof value.noProgressTurns !== "number") return false
+  if (typeof value.budgetWrapupSent !== "boolean") return false
+  if (value.stopReason !== null && typeof value.stopReason !== "string") return false
+  if (!Array.isArray(value.history) || !value.history.every(isHistoryEntry)) return false
+  if (!Array.isArray(value.checkpoints) || !value.checkpoints.every(isCheckpoint)) return false
+  if (value.lastCheckpoint !== null && !isCheckpoint(value.lastCheckpoint)) return false
+  if (typeof value.lastAssistantText !== "string") return false
+  if (typeof value.lastAssistantMessageID !== "string") return false
+  if (typeof value.autoTurns !== "number") return false
+  if (value.lastContinuationAt != null && typeof value.lastContinuationAt !== "number") return false
+  if (value.remainingTokens !== null && typeof value.remainingTokens !== "number") return false
+  if (value.sampledAt != null && typeof value.sampledAt !== "number") return false
+  return true
+}
+
+/** Read only the current session from the server's atomic state file. */
+export async function readPersistedGoal(sessionID: string): Promise<GoalSnapshot | null | undefined> {
+  try {
+    const state: unknown = JSON.parse(await readFile(statePath(), "utf8"))
+    if (!isRecord(state) || (state.version !== 1 && state.version !== 2 && state.version !== 3) || !isRecord(state.goals)) return undefined
+    const stored = state.goals[sessionID]
+    if (stored === undefined) return null
+    if (!isRecord(stored) || stored.sessionID !== sessionID) return undefined
+    const sampledAt = currentEpochSeconds()
+    const timeUsedSeconds = typeof stored.timeUsedSeconds === "number" ? stored.timeUsedSeconds : 0
+    const activeSeconds = stored.status === "active" && typeof stored.lastAccountedAt === "number"
+      ? Math.max(0, sampledAt - stored.lastAccountedAt)
+      : 0
+    const tokenBudget = stored.tokenBudget
+    const tokensUsed = stored.tokensUsed
+    const snapshot = {
+      ...stored,
+      timeUsedSeconds: timeUsedSeconds + activeSeconds,
+      sampledAt,
+      remainingTokens: typeof tokenBudget === "number" && typeof tokensUsed === "number"
+        ? Math.max(0, tokenBudget - tokensUsed)
+        : null,
+    }
+    return isGoalSnapshot(snapshot) ? snapshot : undefined
+  } catch {
+    // Keep the last valid snapshot when the file is unavailable or incomplete.
+    return undefined
+  }
+}
+
+function usePersistedGoal(sessionID: string) {
+  const store = persistedGoalStore(sessionID)
+  store.refs += 1
+  onCleanup(() => {
+    store.refs -= 1
+    if (store.refs <= 0) store.dispose()
+  })
+  return store.persisted
+}
+
+type PersistedGoalStore = {
+  readonly persisted: () => GoalSnapshot | null | undefined
+  refs: number
+  readonly dispose: () => void
+}
+
+const persistedGoalStores = new Map<string, PersistedGoalStore>()
+
+/**
+ * The persisted goal of one session, shared by every surface.
+ *
+ * The sidebar, the input box icon and the popup all read the goal through
+ * one signal, so they cannot show different values, and they refresh
+ * together: one poller, one update, every surface at once. The store lives in
+ * a detached root, so it survives a surface that is re-created (the host
+ * re-creates the prompt on a model or session switch) and is released when
+ * the last surface that uses it goes away.
+ */
+function persistedGoalStore(sessionID: string): PersistedGoalStore {
+  const existing = persistedGoalStores.get(sessionID)
+  if (existing) return existing
+  const store = createRoot((disposeRoot) => {
+    const [persisted, setPersisted] = createSignal<GoalSnapshot | null | undefined>(undefined)
+    let disposed = false
+    let reading = false
+    let lastFile: { ino: number; mtimeMs: number; size: number } | undefined
+    const refresh = async () => {
+      if (reading) return
+      reading = true
+      try {
+        const file = await stat(statePath())
+        if (lastFile && lastFile.ino === file.ino && lastFile.mtimeMs === file.mtimeMs && lastFile.size === file.size) return
+        const next = await readPersistedGoal(sessionID)
+        if (next === undefined) return
+        lastFile = { ino: file.ino, mtimeMs: file.mtimeMs, size: file.size }
+        if (!disposed && (next !== null || persisted() !== undefined)) setPersisted(() => next)
+      } catch {
+        // Missing or unreadable state leaves the last valid view in place.
+      } finally {
+        reading = false
+      }
+    }
+    void refresh()
+    const timer = setInterval(() => void refresh(), 1000)
+    return {
+      persisted,
+      refs: 0,
+      dispose: () => {
+        disposed = true
+        clearInterval(timer)
+        persistedGoalStores.delete(sessionID)
+        disposeRoot()
+      },
+    } satisfies PersistedGoalStore
+  })
+  persistedGoalStores.set(sessionID, store)
+  return store
+}
+
+function parseGoalToolOutput(part: GoalToolPart): GoalSnapshot | null | undefined {
+  if (part.type !== "tool") return undefined
+  if (!GOAL_TOOL_NAMES.includes(part.tool ?? "")) return undefined
+  if (part.state?.status !== "completed") return undefined
+  if (part.tool === "clear_goal") return null
+  if (typeof part.state.output !== "string") return undefined
+
+  try {
+    const parsed: unknown = JSON.parse(part.state.output)
+    if (!isRecord(parsed)) return undefined
+    if (parsed.goal === null) return null
+    return isGoalSnapshot(parsed.goal) ? parsed.goal : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function goalStateFromSession(api: TuiPluginApi, sessionID: string): GoalSessionState {
+  const messages = [...api.state.session.messages(sessionID)] as SessionMessage[]
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex]
+    if (!message) continue
+    const parts = [...api.state.part(message.id)].reverse() as GoalToolPart[]
+    for (const part of parts) {
+      const goal = parseGoalToolOutput(part)
+      if (goal !== undefined) {
+        cacheGoal(api, sessionID, goal)
+        return { goal, messageIndex }
+      }
+    }
+  }
+  return { goal: cachedGoal(api, sessionID), messageIndex: -1 }
+}
+
+function goalFromSession(api: TuiPluginApi, sessionID: string) {
+  return goalStateFromSession(api, sessionID).goal
+}
+
+export function formatGoal(goal: GoalSnapshot | null, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>) {
+  if (!goal) return messages.tui.noGoal
+  const lines = [
+    `${messages.tui.objective}: ${goal.objective}`,
+    `${messages.tui.status}: ${presentGoalStatus(goal.status, locale)}`,
+    `${messages.tui.timeUsed}: ${formatDuration(goal.timeUsedSeconds)}`,
+    `${messages.tui.tokens}: ${goal.tokensUsed}${goal.tokenBudget == null ? "" : `/${goal.tokenBudget}`}`,
+    `${messages.tui.autoContinues}: ${goal.autoTurns}${goal.maxAutoTurns == null ? "" : `/${goal.maxAutoTurns}`}`,
+  ]
+  if (goal.remainingTokens != null) lines.push(`${messages.tui.tokensRemaining}: ${goal.remainingTokens}`)
+  if (goal.maxDurationSeconds != null) lines.push(`${messages.tui.durationLimit}: ${formatDuration(goal.maxDurationSeconds)}`)
+  if (goal.noProgressTurns > 0) lines.push(`${messages.tui.noProgressTurns}: ${goal.noProgressTurns}`)
+  if (goal.lastCheckpoint) lines.push(`${messages.tui.latestCheckpoint}: ${goal.lastCheckpoint.summary}`)
+  if (goal.stopReason) lines.push(`${messages.tui.stopReason}: ${presentGoalStopReason(goal.stopReason, locale)}`)
+  if (goal.lastStatus) lines.push(`${messages.tui.lastStatus}: ${presentGoalLastStatus(goal.lastStatus, locale)}`)
+  if (goal.completionEvidence) lines.push(`${messages.tui.completionEvidence}: ${goal.completionEvidence}`)
+  if (goal.blocker) lines.push(`${messages.tui.blocker}: ${presentGoalLastStatus(goal.blocker, locale)}`)
+  return lines.join("\n")
+}
+
+export type GoalStateLineKind = "title" | "detail" | "objective" | "badge"
+
+export type GoalStateLine = {
+  readonly kind: GoalStateLineKind
+  readonly text: string
+}
+
+/**
+ * The canonical view of the goal state.
+ *
+ * The sidebar renders these lines and the popup shows exactly these lines, so
+ * the two surfaces cannot show different values for the same goal: there is
+ * one function that reads the goal and one list of lines that leaves it.
+ */
+export function goalStateLines(
+  goal: GoalSnapshot,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+  nowSeconds = currentEpochSeconds(),
+): GoalStateLine[] {
+  if (goal.status === "complete" || goal.status === "unmet") {
+    const elapsed = liveTimeUsedSeconds(goal, nowSeconds)
+    return [
+      {
+        kind: "badge",
+        text: `${goal.status === "complete" ? messages.tui.achieved : messages.tui.unmet} (${formatDurationBadge(elapsed)})`,
+      },
+    ]
+  }
+  const detail = (text: string): GoalStateLine => ({ kind: "detail", text })
+  return [
+    { kind: "title", text: messages.tui.title },
+    detail(`${messages.tui.status}: ${presentGoalStatus(goal.status, locale)}`),
+    detail(`${messages.tui.time}: ${formatDuration(liveTimeUsedSeconds(goal, nowSeconds))}`),
+    detail(`${messages.tui.tokens}: ${goal.tokensUsed}${goal.tokenBudget == null ? "" : `/${goal.tokenBudget}`}`),
+    detail(`${messages.tui.autoContinues}: ${goal.autoTurns}${goal.maxAutoTurns == null ? "" : `/${goal.maxAutoTurns}`}`),
+    ...(goal.lastCheckpoint ? [detail(`${messages.tui.checkpoint}: ${goal.lastCheckpoint.summary}`)] : []),
+    ...(goal.stopReason ? [detail(`${messages.tui.stop}: ${presentGoalStopReason(goal.stopReason, locale)}`)] : []),
+    ...(goal.lastStatus ? [detail(presentGoalLastStatus(goal.lastStatus, locale))] : []),
+    { kind: "objective", text: goal.objective },
+  ]
+}
+
+type GoalStateColors = {
+  readonly text: unknown
+  readonly muted: unknown
+  readonly achieved: unknown
+}
+
+/**
+ * The colours of the goal state popup.
+ *
+ * The popup is the only place the goal state is shown when the window is too
+ * small for the sidebar, so it has to read at a glance: the status carries
+ * its own colour, the labels are quiet and the values are plain.
+ */
+type GoalDialogColors = {
+  readonly text: unknown
+  readonly muted: unknown
+  readonly status: unknown
+}
+
+/**
+ * One line of the goal state, with the label and the value in their own
+ * colours.
+ */
+function goalStateLineElement(line: GoalStateLine, colors: GoalDialogColors, messages: GoalMessages) {
+  if (line.kind === "badge" || line.kind === "title") return text({ fg: colors.status }, [line.text])
+  if (line.kind === "objective") return text({ fg: colors.text }, [line.text])
+  const split = line.text.indexOf(": ")
+  if (split < 0) return text({ fg: colors.muted }, [line.text])
+  const label = line.text.slice(0, split + 2)
+  const value = line.text.slice(split + 2)
+  // The status is the one line that carries the colour of the status.
+  const valueColor = label.startsWith(messages.tui.status) ? colors.status : colors.text
+  return text({}, [
+    element("span", { style: { fg: colors.muted } }, [label]),
+    element("span", { style: { fg: valueColor } }, [value]),
+  ])
+}
+
+/**
+ * The content of the goal state popup.
+ *
+ * The state is the same state the sidebar shows - the same lines from the
+ * same function - but it scrolls, so a long objective or a small terminal
+ * still shows every line, and it is coloured, so the status reads at a
+ * glance.
+ */
+function goalStateDialogContent(
+  goal: GoalSnapshot | null,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+  colors: GoalDialogColors,
+  maxHeight: number,
+) {
+  if (!goal) return box({}, [text({ fg: colors.muted }, [messages.tui.noGoal])])
+  const lines = goalStateLines(goal, messages, locale).filter((line) => line.kind !== "title")
+  return box({ flexDirection: "column" }, [
+    text({ fg: colors.status }, [`${goalStatusGlyph(goal.status)} ${messages.tui.title}`]),
+    element(
+      "scrollbox",
+      { scrollY: true, maxHeight, flexShrink: 1 },
+      [box({ flexDirection: "column" }, lines.map((line) => goalStateLineElement(line, colors, messages)))],
+    ),
+    text({ fg: colors.muted }, [messages.tui.closeHint]),
+  ])
+}
+
+/** The height of the scrolling area of the popup, in rows. */
+function goalDialogMaxHeight(renderer: { height?: number } | undefined) {
+  const rows = typeof renderer?.height === "number" ? renderer.height : 24
+  return Math.max(6, Math.min(24, rows - 10))
+}
+
+/**
+ * Resolves the goal the surfaces show.
+ *
+ * The persisted state file and the session messages are two views of the same
+ * goal: the file is written by the server, the messages carry the tool result
+ * the agent saw. The newer of the two wins, and a goal that was cleared in the
+ * messages is gone. Every surface resolves the goal through this function, so
+ * the sidebar, the popup and the input box icon always agree.
+ */
+export function resolveGoal(
+  persisted: GoalSnapshot | null | undefined,
+  fromMessages: GoalSnapshot | null | undefined,
+  fallback: GoalSnapshot | null = null,
+): GoalSnapshot | null {
+  if (fromMessages === null) return null
+  if (persisted !== undefined) {
+    if (fromMessages && persisted && (fromMessages.createdAt > persisted.createdAt || fromMessages.updatedAt > persisted.updatedAt))
+      return fromMessages
+    return persisted
+  }
+  return fromMessages === undefined ? fallback : fromMessages
+}
+
+/**
+ * Renders the shared goal state lines as text elements.
+ *
+ * The sidebar and the popup read the same lines, so only the colours differ
+ * between the two surfaces.
+ */
+function goalStateElements(lines: GoalStateLine[], status: GoalStatus, colors: GoalStateColors) {
+  return lines.map((line) => {
+    if (line.kind === "badge") return text({ fg: status === "complete" ? colors.achieved : colors.muted }, [line.text])
+    if (line.kind === "title") return text({ fg: colors.text }, [line.text])
+    return text({ fg: colors.muted }, [line.text])
+  })
+}
+
+function GoalSidebar(api: TuiPluginApi, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>, sessionID: string) {
+  const theme = api.theme.current
+  const state = goalStateFromSession(api, sessionID)
+  if (!state.goal) return null
+  const persisted = usePersistedGoal(sessionID)
+  const goal = createMemo(() => resolveGoal(persisted(), state.goal ?? undefined))
+  const [nowSeconds, setNowSeconds] = createSignal(currentEpochSeconds())
+  const active = createMemo(() => goal()?.status === "active")
+  createEffect(() => {
+    if (!active()) return
+    const timer = setInterval(() => setNowSeconds(currentEpochSeconds()), 1000)
+    onCleanup(() => clearInterval(timer))
+  })
+  return box({}, [() => {
+    const snapshot = goal()
+    if (!snapshot) return null
+    return box({}, goalStateElements(goalStateLines(snapshot, messages, locale, nowSeconds()), snapshot.status, {
+      text: theme.text,
+      muted: theme.textMuted,
+      achieved: theme.primary,
+    }))
+  }])
+}
+
+/**
+ * The popup that shows the goal state, for the V1 TUI.
+ *
+ * The sidebar is not rendered on a narrow window, so the state has to stay
+ * reachable without it. The popup reads the same goal and renders the same
+ * lines as the sidebar, so the two can never show different values.
+ */
+async function showGoalStatePopupV1(
+  api: TuiPluginApi,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+) {
+  const sessionID = currentSessionID(api)
+  if (!sessionID) {
+    toast(api, messages, messages.tui.openSession, "warning")
+    return
+  }
+  const goal = resolveGoal(
+    await readPersistedGoal(sessionID),
+    goalFromSession(api, sessionID) ?? undefined,
+  )
+  const theme = api.theme.current
+  try {
+    api.ui.dialog.setSize("large")
+    api.ui.dialog.replace(() =>
+      goalStateDialogContent(
+        goal,
+        messages,
+        locale,
+        {
+          text: theme.text,
+          muted: theme.textMuted,
+          status: goal ? goalStatusColorV1(goal.status, theme) : theme.textMuted,
+        },
+        goalDialogMaxHeight(api.renderer),
+      ),
+    )
+  } catch (error) {
+    toast(api, messages, error instanceof Error ? error.message : String(error), "error")
+  }
+}
+
+/**
+ * The goal status icon in the input box.
+ *
+ * The status line of the input box is the one place in the prompt that a
+ * plugin owns, so the icon sits there, on the line under the model and the
+ * thinking effort. It reads the same goal the sidebar reads, through the same
+ * signal, so the icon and the sidebar always show the same status and change
+ * at the same moment.
+ */
+function GoalStatusIconV2(api: TuiPluginV2.Context, sessionID: string | undefined) {
+  const id = sessionID ?? currentSessionIDV2(api)
+  const persisted = id ? usePersistedGoal(id) : undefined
+  const messageGoal = createMemo(() => (id ? goalFromV2Messages(api.data.session.message.list(id)) : undefined))
+  const goal = createMemo(() => resolveGoal(persisted?.(), messageGoal()))
+  return box({}, [() => {
+    const snapshot = goal()
+    // Without a goal the box stays empty, so the input box keeps its height.
+    if (!snapshot) return null
+    return text({ fg: goalStatusColorV2(snapshot.status, api.theme) }, [goalStatusGlyph(snapshot.status)])
+  }])
+}
+
+/**
+ * The goal status icon next to the prompt, for the V1 TUI.
+ *
+ * The V1 host has no status line inside the prompt, so the icon goes to the
+ * right of the prompt instead.
+ */
+function GoalStatusIconV1(api: TuiPluginApi, sessionID: string | undefined) {
+  const id = sessionID ?? currentSessionID(api)
+  const persisted = id ? usePersistedGoal(id) : undefined
+  const messageGoal = createMemo(() => (id ? goalFromSession(api, id) ?? undefined : undefined))
+  const goal = createMemo(() => resolveGoal(persisted?.(), messageGoal()))
+  return box({}, [() => {
+    const snapshot = goal()
+    if (!snapshot) return null
+    const theme = api.theme.current
+    return text(
+      {
+        fg: goalStatusColorV1(snapshot.status, {
+          text: theme.text,
+          textMuted: theme.textMuted,
+          warning: theme.warning,
+          success: theme.success,
+          error: theme.error,
+        }),
+      },
+      [goalStatusGlyph(snapshot.status)],
+    )
+  }])
+}
+
+function registerGoalCommand(api: TuiPluginApi, command: TuiCommand) {
+  const modern = api as ModernTuiApi
+  if (modern.keymap?.registerLayer) {
+    modern.keymap.registerLayer({
+      commands: [
+        {
+          namespace: "palette",
+          name: command.value,
+          title: command.title,
+          desc: command.description,
+          category: command.category,
+          run: command.onSelect,
+        },
+      ],
+      bindings: [],
+    })
+    return
+  }
+  api.command?.register(() => [command])
+}
+
+const tui: TuiPlugin = async (api, options) => {
+  const locale = resolveLocale(typeof options?.locale === "string" ? options.locale : undefined)
+  const messages = messagesFor(locale)
+  api.slots.register({
+    order: 125,
+    slots: {
+      sidebar_content(_ctx, props) {
+        return GoalSidebar(api, messages, locale, props.session_id)
+      },
+      // The V1 host has no status line inside the prompt, so the icon goes to
+      // the right of the prompt.
+      session_prompt_right(_ctx, props) {
+        return GoalStatusIconV1(api, props.session_id)
+      },
+    },
+  })
+
+  registerGoalCommand(api, {
+    title: messages.tui.title,
+    value: "goal.show",
+    category: messages.tui.title,
+    description: messages.tui.commandDescription,
+    onSelect: () => {
+      const sessionID = sessionIDOrToast(api, messages)
+      if (!sessionID) return
+      showSummary(api, messages, locale, sessionID, goalFromSession(api, sessionID))
+    },
+  })
+
+  // The legacy command API is the one that carries a keybind, so the popup
+  // opens from a key there. It is deprecated, but it is the shape that the
+  // V1 host still honours.
+  api.command?.register(() => [
+    {
+      title: messages.tui.stateTitle,
+      value: "goal.state",
+      category: messages.tui.title,
+      description: messages.tui.stateDescription,
+      keybind: GOAL_STATE_KEYBIND,
+      onSelect: () => {
+        void showGoalStatePopupV1(api, messages, locale)
+      },
+    },
+  ])
+}
+
+// --- V2 TUI plugin ---
+
+/**
+ * Scans the V2 session message list for the newest completed goal tool result.
+ * Assistant tool content entries carry `name` plus a completed `state.content`
+ * array; goal tool output is serialized in text ToolContent parts. Returns
+ * `undefined` when no goal tool output is present (so callers can fall back to
+ * a cached snapshot), `null` after a completed clear_goal, or the snapshot.
+ */
+export function goalFromV2Messages(messages: readonly SessionMessageInfo[]): GoalSnapshot | null | undefined {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex]
+    if (!message || message.type !== "assistant") continue
+    const parts = message.content
+    for (let partIndex = parts.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = parts[partIndex]
+      if (!part || part.type !== "tool") continue
+      if (!GOAL_TOOL_NAMES.includes(part.name)) continue
+      if (part.state.status !== "completed") continue
+      if (part.name === "clear_goal") return null
+      const textContent = part.state.content.find((entry) => entry.type === "text")
+      if (!textContent) continue
+      try {
+        const parsed: unknown = JSON.parse(textContent.text)
+        if (!isRecord(parsed)) continue
+        if (parsed.goal === null) return null
+        if (isGoalSnapshot(parsed.goal)) return parsed.goal
+      } catch {
+        // Malformed tool output: keep scanning older tool entries.
+      }
+    }
+  }
+  return undefined
+}
+
+function currentSessionIDV2(api: TuiPluginV2.Context) {
+  const route = api.ui.router.current()
+  if (route.type !== "session") return undefined
+  return route.sessionID
+}
+
+function toastV2(
+  api: TuiPluginV2.Context,
+  messages: GoalMessages,
+  message: string,
+  variant: "info" | "success" | "warning" | "error" = "info",
+) {
+  api.ui.toast.show({ title: messages.tui.title, message, variant, duration: 2500 })
+}
+
+async function showSummaryV2(
+  api: TuiPluginV2.Context,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+  sessionID: string,
+  goal: GoalSnapshot | null,
+) {
+  const options = [
+    { title: messages.tui.refresh, value: "refresh", description: messages.tui.refreshDescription },
+    ...(goal
+      ? [
+          { title: messages.tui.history, value: "history", description: messages.tui.historyDescription },
+          ...(goal.status === "active"
+            ? [{ title: messages.tui.pause, value: "pause", description: messages.tui.pauseDescription }]
+            : []),
+          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited"
+            ? [{ title: messages.tui.resume, value: "resume", description: messages.tui.resumeDescription }]
+            : []),
+          { title: messages.tui.clear, value: "clear", description: messages.tui.clearDescription },
+        ]
+      : []),
+  ]
+  api.ui.dialog.set({ size: "large" })
+  let selected: string | undefined
+  try {
+    selected = await api.ui.dialog.select({
+      title: messages.tui.title,
+      placeholder: formatGoal(goal, messages, locale),
+      options,
+    })
+  } catch (error) {
+    // The command runs detached, so a rejection here would be an unhandled
+    // rejection in the host's TUI process.
+    toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
+    return
+  }
+  const prompt = selected === "refresh" ? refreshGoalPrompt(messages)
+    : selected === "history" ? historyGoalPrompt(messages)
+    : selected === "pause" ? pauseGoalPrompt(messages)
+    : selected === "resume" ? resumeGoalPrompt(messages)
+    : selected === "clear" ? clearGoalPrompt(messages)
+    : undefined
+  if (!prompt) return
+  try {
+    await api.client.session.prompt({ sessionID, text: prompt })
+  } catch (error) {
+    toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
+  }
+}
+
+function GoalSidebarV2(
+  api: TuiPluginV2.Context,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+  sessionID: string,
+) {
+  const colors = goalColorsV2(api.theme)
+  const [cache, setCache] = api.storage.memory<{ goal: GoalSnapshot | null }>(`goal-mode.v2.${sessionID}`, {
+    initial: { goal: null },
+  })
+  const persisted = usePersistedGoal(sessionID)
+  const messageGoal = createMemo(() => goalFromV2Messages(api.data.session.message.list(sessionID)))
+  const goal = createMemo<GoalSnapshot | null>(() => {
+    const found = messageGoal()
+    if (found === null) return null
+    return resolveGoal(persisted(), found, cache.goal)
+  })
+  createEffect(() =>
+    setCache((draft) => {
+      draft.goal = goal()
+    }),
+  )
+
+  const [nowSeconds, setNowSeconds] = createSignal(currentEpochSeconds())
+  const active = createMemo(() => goal()?.status === "active")
+  createEffect(() => {
+    if (!active()) return
+    const timer = setInterval(() => setNowSeconds(currentEpochSeconds()), 1000)
+    onCleanup(() => clearInterval(timer))
+  })
+  return box({}, [() => {
+    const snapshot = goal()
+    if (!snapshot) return null
+    return box({}, goalStateElements(goalStateLines(snapshot, messages, locale, nowSeconds()), snapshot.status, {
+      text: colors.text,
+      muted: colors.muted,
+      achieved: colors.achieved,
+    }))
+  }])
+}
+
+/**
+ * The popup that shows the goal state.
+ *
+ * The sidebar is not rendered on a narrow window, so the state has to stay
+ * reachable without it. The popup reads the same goal and renders the same
+ * lines as the sidebar, so the two can never show different values.
+ */
+async function showGoalStatePopupV2(
+  api: TuiPluginV2.Context,
+  messages: GoalMessages,
+  locale: ReturnType<typeof resolveLocale>,
+) {
+  const sessionID = currentSessionIDV2(api)
+  if (!sessionID) {
+    toastV2(api, messages, messages.tui.openSession, "warning")
+    return
+  }
+  const goal = resolveGoal(
+    await readPersistedGoal(sessionID),
+    goalFromV2Messages(api.data.session.message.list(sessionID)),
+  )
+  const colors = goalColorsV2(api.theme)
+  try {
+    api.ui.dialog.show(() =>
+      goalStateDialogContent(
+        goal,
+        messages,
+        locale,
+        {
+          text: colors.text,
+          muted: colors.muted,
+          status: goal ? goalStatusColorV2(goal.status, api.theme) : colors.muted,
+        },
+        goalDialogMaxHeight(api.renderer),
+      ),
+    )
+    // The dialog host resets the presentation while it pushes the content onto
+    // the stack, so the size is applied after the content was pushed.
+    try {
+      api.ui.dialog.set({ size: "large", centered: true })
+    } catch {
+      // The presentation options are best effort.
+    }
+  } catch (error) {
+    // The command runs detached, so a rejection here would be an unhandled
+    // rejection in the host's TUI process.
+    toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
+  }
+}
+
+function GoalKeymapLayerV2(api: TuiPluginV2.Context, messages: GoalMessages, locale: ReturnType<typeof resolveLocale>) {
+  api.keymap.layer(() => ({
+    mode: "global",
+    commands: [
+      {
+        id: "goal.show",
+        title: messages.tui.title,
+        description: messages.tui.commandDescription,
+        group: messages.tui.title,
+        palette: true,
+        run: () => {
+          const sessionID = currentSessionIDV2(api)
+          if (!sessionID) {
+            toastV2(api, messages, messages.tui.openSession, "warning")
+            return
+          }
+          const goal = goalFromV2Messages(api.data.session.message.list(sessionID)) ?? null
+          void showSummaryV2(api, messages, locale, sessionID, goal)
+        },
+      },
+      {
+        id: "goal.state",
+        title: messages.tui.stateTitle,
+        description: messages.tui.stateDescription,
+        group: messages.tui.title,
+        palette: true,
+        bind: GOAL_STATE_KEYBIND,
+        run: () => {
+          void showGoalStatePopupV2(api, messages, locale)
+        },
+      },
+    ],
+  }))
+  return null
+}
+
+/**
+ * V2 TUI setup: registers the goal sidebar via `ui.slot` and a palette command
+ * through a keymap layer mounted from the global `app` slot. `keymap.layer`
+ * must be invoked from a Solid component scope, so the layer lives inside a
+ * component rendered by the `app` slot; its cleanup is owned by that component
+ * and released automatically when the slot unmounts. The setup cleanup only
+ * needs to dispose the two `ui.slot` registrations.
+ */
+export function setupTuiV2(context: TuiPluginV2.Context): TuiPluginV2.Cleanup {
+  const locale = resolveLocale(typeof context.options?.locale === "string" ? context.options.locale : undefined)
+  const messages = messagesFor(locale)
+  const offSidebar = registerSlotV2(context, "sidebar.content", (props) =>
+    GoalSidebarV2(context, messages, locale, props.sessionID),
+  )
+  // The status line of the input box: the icon sits under the model and the
+  // thinking effort, in the one place of the prompt that a plugin owns. The
+  // status slot publishes the session id as an optional value.
+  const offStatus = registerSlotV2(context, "prompt.footer.status", (props) =>
+    GoalStatusIconV2(context, (props as { sessionID?: string }).sessionID),
+  )
+  const offApp = registerSlotV2(context, "app", () => GoalKeymapLayerV2(context, messages, locale))
+  return () => {
+    offSidebar()
+    offStatus()
+    offApp()
+  }
+}
+
+const plugin: TuiPluginModule & TuiPluginV2.Definition = {
+  id: "local.goal-mode.tui",
+  tui,
+  setup: setupTuiV2,
+}
+
+export default plugin
