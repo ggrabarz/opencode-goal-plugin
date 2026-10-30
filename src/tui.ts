@@ -716,11 +716,7 @@ async function showSummaryV2(
     : selected === "clear" ? clearGoalPrompt(messages)
     : undefined
   if (!prompt) return
-  try {
-    await api.client.session.prompt({ sessionID, text: prompt })
-  } catch (error) {
-    toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
-  }
+  await api.client.session.prompt({ sessionID, text: prompt })
 }
 
 function GoalSidebarV2(
@@ -808,14 +804,22 @@ function GoalKeymapLayerV2(api: TuiPluginV2.Context, messages: GoalMessages, loc
         description: messages.tui.commandDescription,
         group: messages.tui.title,
         palette: true,
-        run: () => {
-          const sessionID = currentSessionIDV2(api)
-          if (!sessionID) {
-            toastV2(api, messages, messages.tui.openSession, "warning")
-            return
+        run: async () => {
+          try {
+            const sessionID = currentSessionIDV2(api)
+            if (!sessionID) {
+              toastV2(api, messages, messages.tui.openSession, "warning")
+              return
+            }
+            const goal = goalFromV2Messages(api.data.session.message.list(sessionID)) ?? null
+            await showSummaryV2(api, messages, locale, sessionID, goal)
+          } catch (error) {
+            try {
+              toastV2(api, messages, error instanceof Error ? error.message : String(error), "error")
+            } catch {
+              return
+            }
           }
-          const goal = goalFromV2Messages(api.data.session.message.list(sessionID)) ?? null
-          void showSummaryV2(api, messages, locale, sessionID, goal)
         },
       },
     ],
