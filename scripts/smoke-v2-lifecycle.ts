@@ -155,6 +155,7 @@ async function stopServerTree() {
     const groupExists = () => {
       try { process.kill(-child.pid!, 0); return true } catch (error) {
         if (isMissingProcess(error)) return false
+        if (typeof error === "object" && error !== null && "code" in error && error.code === "EPERM") return true
         throw error
       }
     }
@@ -171,18 +172,26 @@ async function stopServerTree() {
 }
 let cleanup: Promise<void> | undefined
 const stop = () => cleanup ??= stopServerTree()
+let interruptionCode: number | undefined
 const interrupt = (code: number) => {
+  interruptionCode ??= code
   void stop().catch((error: unknown) => console.error("Smoke cleanup failed:", error)).finally(() => {
     child.stdout.destroy()
     child.stderr.destroy()
     model.stop(true)
-    process.exit(code)
+    process.exit(interruptionCode)
   })
 }
 const onInterrupt = () => interrupt(130)
 const onTerminate = () => interrupt(143)
+const onHangup = () => interrupt(129)
+const onQuit = () => interrupt(131)
 process.once("SIGINT", onInterrupt)
 process.once("SIGTERM", onTerminate)
+if (process.platform !== "win32") {
+  process.once("SIGHUP", onHangup)
+  process.once("SIGQUIT", onQuit)
+}
 const deadline = Date.now() + Number(process.env.OPENCODE_SMOKE_TIMEOUT_MS ?? 30000)
 let lastStage: string | undefined
 const waitFor = async (stage: string, check: () => boolean | Promise<boolean>, diagnose?: () => string) => {
@@ -319,6 +328,10 @@ try {
     child.unref()
     process.removeListener("SIGINT", onInterrupt)
     process.removeListener("SIGTERM", onTerminate)
+    if (process.platform !== "win32") {
+      process.removeListener("SIGHUP", onHangup)
+      process.removeListener("SIGQUIT", onQuit)
+    }
     model.stop(true)
   }
   // On failure, preserve diagnostics before the temp root disappears: a bare
@@ -347,6 +360,7 @@ try {
   }
 }
 
+if (interruptionCode !== undefined) process.exit(interruptionCode)
 if (failure !== undefined) throw failure
 console.log(JSON.stringify(summary, null, 2))
 } finally {
