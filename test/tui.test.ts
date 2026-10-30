@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
+import { afterAll, afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
 import { mkdtempSync, rmSync, unlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -15,9 +15,6 @@ async function writeGoalState(value: unknown) {
   // Keep fixtures on the same atomic replacement and retry path as state writes.
   await atomicWriteFile(isolatedStatePath, JSON.stringify(value))
 }
-
-beforeAll(() => {
-})
 
 beforeEach(() => {
   previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH

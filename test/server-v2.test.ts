@@ -273,6 +273,7 @@ async function createGoalViaV2Tool(mock: MockContext, objective: string, agent =
 
 let dir = ""
 let previousStatePath: string | undefined
+let previousClient: string | undefined
 const setupDisposers: Array<() => void | Promise<void>> = []
 
 async function setupPlugin(...args: Parameters<typeof plugin.setup>) {
@@ -293,6 +294,7 @@ beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-v2-"))
   previousStatePath = process.env.OPENCODE_GOAL_STATE_PATH
   process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals.json")
+  previousClient = process.env.OPENCODE_CLIENT
   process.env.OPENCODE_CLIENT = "acp"
 })
 
@@ -300,7 +302,8 @@ afterEach(async () => {
   for (const dispose of setupDisposers.splice(0).reverse()) await dispose()
   if (previousStatePath === undefined) delete process.env.OPENCODE_GOAL_STATE_PATH
   else process.env.OPENCODE_GOAL_STATE_PATH = previousStatePath
-  delete process.env.OPENCODE_CLIENT
+  if (previousClient === undefined) delete process.env.OPENCODE_CLIENT
+  else process.env.OPENCODE_CLIENT = previousClient
   await rm(dir, { recursive: true, force: true })
 })
 
