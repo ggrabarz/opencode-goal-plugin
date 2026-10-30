@@ -132,6 +132,9 @@ async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
     clearTimeout(timer)
   }
 }
+function isMissingProcess(error: unknown) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH"
+}
 async function stopServerTree() {
   if (child.pid === undefined) return
   if (process.platform === "win32") {
@@ -151,12 +154,12 @@ async function stopServerTree() {
   } else {
     const groupExists = () => {
       try { process.kill(-child.pid!, 0); return true } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ESRCH") return false
+        if (isMissingProcess(error)) return false
         throw error
       }
     }
     try { process.kill(-child.pid, "SIGKILL") } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
+      if (!isMissingProcess(error)) throw error
     }
     const stopDeadline = Date.now() + 3000
     while (groupExists()) {
